@@ -1,0 +1,22 @@
+[package]
+name = "quant-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "quant"
+path = "src/main.rs"
+
+[dependencies]
+quant-core = { path = "../core" }
+quant-gguf-bridge = { path = "../gguf-bridge" }
+quant-hw-probe = { path = "../hw-probe" }
+clap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

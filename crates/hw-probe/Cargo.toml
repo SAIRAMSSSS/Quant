@@ -1,0 +1,16 @@
+[package]
+name = "quant-hw-probe"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+quant-core = { path = "../core" }
+thiserror.workspace = true
+serde.workspace = true
+libloading.workspace = true
+libc.workspace = true

@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "quant_engine"
+version = "0.1.0"
+description = "Target-Driven Mixed-Precision GGUF Quantization Engine Python Bindings"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = []
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "quant_engine"

@@ -1,0 +1,22 @@
+[package]
+name = "quant-py"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "quant_engine"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+quant-core = { path = "../core" }
+quant-gguf-bridge = { path = "../gguf-bridge" }
+quant-hw-probe = { path = "../hw-probe" }
+pyo3.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
