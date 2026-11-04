@@ -1,3 +1,434 @@
-fn main() -> anyhow::Result<()> {
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use quant_core::mckp::{MckpSolver, QuantizationPlan};
+use quant_core::safetensors::{fetch_remote_header, parse_from_file, SafetensorsHeader};
+use quant_core::types::GgmlType;
+use quant_gguf_bridge::reader::inspect_gguf_file;
+use quant_gguf_bridge::streamer::StreamQuantizer;
+use quant_hw_probe::probe_hardware;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "quant",
+    author = "Staff Systems & ML Infrastructure Engineer",
+    version = "0.1.0",
+    about = "Target-driven mixed-precision GGUF quantization engine"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    Plan {
+        #[arg(short, long, help = "Path to local model file or remote HF URL")]
+        model: String,
+
+        #[arg(
+            short,
+            long,
+            default_value = "auto",
+            help = "Target VRAM budget (e.g. '4GB', '3.5GiB', or 'auto')"
+        )]
+        target_vram: String,
+
+        #[arg(short, long, default_value_t = 4096, help = "Context length in tokens")]
+        ctx_size: usize,
+
+        #[arg(
+            short,
+            long,
+            default_value = "f16",
+            help = "KV cache element type (f16, q8_0, q4_0)"
+        )]
+        kv_type: String,
+
+        #[arg(long, default_value_t = 512, help = "Runtime overhead budget in MiB")]
+        overhead_mb: usize,
+    },
+
+    Compress {
+        #[arg(short, long, help = "Path to input .safetensors model")]
+        model: PathBuf,
+
+        #[arg(short, long, help = "Path to output .gguf model")]
+        output: PathBuf,
+
+        #[arg(
+            short,
+            long,
+            default_value = "auto",
+            help = "Target VRAM budget (e.g. '4GB', '3.5GiB', or 'auto')"
+        )]
+        target_vram: String,
+
+        #[arg(short, long, default_value_t = 4096, help = "Context length in tokens")]
+        ctx_size: usize,
+
+        #[arg(
+            short,
+            long,
+            default_value = "f16",
+            help = "KV cache element type (f16, q8_0, q4_0)"
+        )]
+        kv_type: String,
+
+        #[arg(long, default_value_t = 512, help = "Runtime overhead budget in MiB")]
+        overhead_mb: usize,
+    },
+
+    Inspect {
+        #[arg(
+            short,
+            long,
+            help = "Path to local file (.safetensors, .gguf) or remote URL"
+        )]
+        model: String,
+    },
+}
+
+fn parse_size_to_bytes(s: &str) -> Result<u64> {
+    let lower = s.to_ascii_lowercase().trim().to_string();
+    if lower == "auto" {
+        let hw = probe_hardware();
+        let target = hw.recommend_vram_target(0.10);
+        return Ok(target);
+    }
+
+    if let Some(num) = lower.strip_suffix("gib") {
+        let val: f64 = num.trim().parse().context("invalid GiB number")?;
+        return Ok((val * 1024.0 * 1024.0 * 1024.0) as u64);
+    }
+    if let Some(num) = lower.strip_suffix("gb") {
+        let val: f64 = num.trim().parse().context("invalid GB number")?;
+        return Ok((val * 1_000_000_000.0) as u64);
+    }
+    if let Some(num) = lower.strip_suffix("mib") {
+        let val: f64 = num.trim().parse().context("invalid MiB number")?;
+        return Ok((val * 1024.0 * 1024.0) as u64);
+    }
+    if let Some(num) = lower.strip_suffix("mb") {
+        let val: f64 = num.trim().parse().context("invalid MB number")?;
+        return Ok((val * 1_000_000.0) as u64);
+    }
+
+    let raw: u64 = lower.parse().context("invalid byte count or unit")?;
+    Ok(raw)
+}
+
+fn extract_model_tensors_map(header: &SafetensorsHeader) -> HashMap<String, (Vec<usize>, usize)> {
+    let mut map = HashMap::with_capacity(header.tensors.len());
+    for (k, v) in &header.tensors {
+        map.insert(k.clone(), (v.shape.clone(), v.element_count()));
+    }
+    map
+}
+
+fn estimate_kv_cache(header: &SafetensorsHeader, ctx_len: usize, kv_type: GgmlType) -> usize {
+    let mut n_layers = 0usize;
+    let n_kv_heads = 8usize;
+    let mut head_dim = 128usize;
+
+    for (name, meta) in &header.tensors {
+        if name.contains("layers.") {
+            let parts: Vec<&str> = name.split('.').collect();
+            for (idx, &part) in parts.iter().enumerate() {
+                if part == "layers" && idx + 1 < parts.len() {
+                    if let Ok(num) = parts[idx + 1].parse::<usize>() {
+                        if num + 1 > n_layers {
+                            n_layers = num + 1;
+                        }
+                    }
+                }
+            }
+        }
+        if name.contains("k_proj") && meta.shape.len() >= 2 {
+            head_dim = meta.shape[1].min(128);
+        }
+    }
+
+    if n_layers == 0 {
+        n_layers = 32;
+    }
+
+    let cfg = quant_core::KvCacheConfig::new(n_layers, n_kv_heads, head_dim, ctx_len, kv_type);
+    cfg.total_bytes().unwrap_or(512 * 1024 * 1024)
+}
+
+fn load_safetensors_header(target: &str) -> Result<SafetensorsHeader> {
+    if target.starts_with("http://") || target.starts_with("https://") {
+        let hdr =
+            fetch_remote_header(target).context("failed to fetch remote safetensors header")?;
+        Ok(hdr)
+    } else {
+        let path = Path::new(target);
+        if !path.exists() {
+            bail!("input file not found: {}", target);
+        }
+        let hdr = parse_from_file(path).context("failed to parse local safetensors header")?;
+        Ok(hdr)
+    }
+}
+
+fn render_plan_ascii_table(plan: &QuantizationPlan) {
+    println!(
+        "+--------------------------------------------------+--------------+--------------------+------------+--------+--------+------------+------------+"
+    );
+    println!(
+        "| {:<48} | {:<12} | {:<18} | {:>10} | {:<6} | {:>6} | {:>10} | {:>10} |",
+        "Tensor Name", "Role", "Shape", "Elements", "Quant", "BPW", "Size (MiB)", "Distortion"
+    );
+    println!(
+        "+--------------------------------------------------+--------------+--------------------+------------+--------+--------+------------+------------+"
+    );
+
+    let display_limit = 24;
+    let total_items = plan.tensor_plans.len();
+
+    for (i, p) in plan.tensor_plans.iter().enumerate() {
+        if total_items > display_limit && i == 12 {
+            println!(
+                "| {:<48} | {:<12} | {:<18} | {:>10} | {:<6} | {:>6} | {:>10} | {:>10} |",
+                format!("... [{} tensors omitted for brevity] ...", total_items - 20),
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "-"
+            );
+            continue;
+        }
+        if total_items > display_limit && i > 12 && i < total_items - 8 {
+            continue;
+        }
+
+        let name_trunc = if p.name.len() > 48 {
+            format!("{}...", &p.name[..45])
+        } else {
+            p.name.clone()
+        };
+
+        let shape_str = format!("{:?}", p.shape);
+        let shape_trunc = if shape_str.len() > 18 {
+            format!("{}...", &shape_str[..15])
+        } else {
+            shape_str
+        };
+
+        let size_mb = (p.size_bytes as f64) / (1024.0 * 1024.0);
+        let role_str = format!("{:?}", p.role);
+
+        println!(
+            "| {:<48} | {:<12} | {:<18} | {:>10} | {:<6} | {:>6.2} | {:>10.2} | {:>10.4} |",
+            name_trunc,
+            role_str,
+            shape_trunc,
+            p.num_elements,
+            p.selected_type.as_str(),
+            p.bpw,
+            size_mb,
+            p.distortion
+        );
+    }
+
+    println!(
+        "+--------------------------------------------------+--------------+--------------------+------------+--------+--------+------------+------------+"
+    );
+
+    let weight_gib = (plan.total_weight_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let kv_gib = (plan.kv_cache_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let overhead_gib = (plan.overhead_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let total_gib = (plan.total_vram_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let target_gib = (plan.target_vram_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let margin_gib = (plan.margin_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+
+    println!("\nPLAN SUMMARY");
+    println!("  Target VRAM Budget:    {:>8.3} GiB", target_gib);
+    println!("  Total Weight Footprint:{:>8.3} GiB", weight_gib);
+    println!("  KV Cache Footprint:    {:>8.3} GiB", kv_gib);
+    println!("  Runtime Overhead:      {:>8.3} GiB", overhead_gib);
+    println!("  ---------------------------------------");
+    println!("  Total Projected Memory:{:>8.3} GiB", total_gib);
+    println!("  Memory Margin:         {:>8.3} GiB", margin_gib);
+    println!("  Cumulative Distortion: {:>8.4}", plan.total_distortion);
+
+    let hist = plan.type_histogram();
+    let mut hist_vec: Vec<(GgmlType, usize)> = hist.into_iter().collect();
+    hist_vec.sort_by_key(|b| b.1);
+    hist_vec.reverse();
+
+    print!("  Quantization Mixture:  ");
+    for (t, count) in hist_vec {
+        print!("{}: {} tensors  ", t.as_str(), count);
+    }
+    println!();
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Plan {
+            model,
+            target_vram,
+            ctx_size,
+            kv_type,
+            overhead_mb,
+        } => {
+            let target_bytes = parse_size_to_bytes(&target_vram)?;
+            let kv_enum = GgmlType::from_str_case_insensitive(&kv_type).unwrap_or(GgmlType::F16);
+            let overhead_bytes = overhead_mb * 1024 * 1024;
+
+            println!(
+                "Inspecting model header from: {} (Zero-Weight-Load Planning)",
+                model
+            );
+            let header = load_safetensors_header(&model)?;
+            let tensor_map = extract_model_tensors_map(&header);
+            let kv_bytes = estimate_kv_cache(&header, ctx_size, kv_enum);
+
+            let groups = MckpSolver::build_tensor_groups(&tensor_map)?;
+            let plan = MckpSolver::solve(&groups, target_bytes as usize, kv_bytes, overhead_bytes)?;
+
+            render_plan_ascii_table(&plan);
+        }
+
+        Commands::Compress {
+            model,
+            output,
+            target_vram,
+            ctx_size,
+            kv_type,
+            overhead_mb,
+        } => {
+            if !model.exists() {
+                bail!("input model path does not exist: {}", model.display());
+            }
+
+            let target_bytes = parse_size_to_bytes(&target_vram)?;
+            let kv_enum = GgmlType::from_str_case_insensitive(&kv_type).unwrap_or(GgmlType::F16);
+            let overhead_bytes = overhead_mb * 1024 * 1024;
+
+            println!("Generating quantization plan for: {}", model.display());
+            let header = parse_from_file(&model)?;
+            let tensor_map = extract_model_tensors_map(&header);
+            let kv_bytes = estimate_kv_cache(&header, ctx_size, kv_enum);
+
+            let groups = MckpSolver::build_tensor_groups(&tensor_map)?;
+            let plan = MckpSolver::solve(&groups, target_bytes as usize, kv_bytes, overhead_bytes)?;
+
+            render_plan_ascii_table(&plan);
+
+            println!(
+                "\nExecuting streaming quantization to: {}",
+                output.display()
+            );
+            let written = StreamQuantizer::stream_safetensors_to_gguf(&model, &output, &plan)?;
+
+            let written_gib = (written as f64) / (1024.0 * 1024.0 * 1024.0);
+            println!(
+                "Quantization complete. Payload size: {:.3} GiB. Output: {}",
+                written_gib,
+                output.display()
+            );
+        }
+
+        Commands::Inspect { model } => {
+            let path = Path::new(&model);
+            if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
+                let gguf_hdr = inspect_gguf_file(path)?;
+                println!("GGUF File Inspection: {}", model);
+                println!("  Version:           {}", gguf_hdr.version);
+                println!("  Alignment:         {}", gguf_hdr.alignment);
+                println!("  Tensor Count:      {}", gguf_hdr.tensor_count);
+                println!("  Metadata KV Count: {}", gguf_hdr.metadata_kv_count);
+                println!("  Data Start Offset: 0x{:X}", gguf_hdr.data_offset);
+
+                println!("\n  Metadata Entries:");
+                for (k, v) in &gguf_hdr.metadata {
+                    println!("    {}: {:?}", k, v);
+                }
+
+                println!("\n  Tensors (first 10):");
+                for (i, t) in gguf_hdr.tensors.iter().take(10).enumerate() {
+                    println!(
+                        "    [{:03}] {:<40} {:<6} dims={:?} offset=0x{:X}",
+                        i,
+                        t.name,
+                        t.ggml_type.as_str(),
+                        t.dimensions,
+                        t.offset
+                    );
+                }
+            } else {
+                let header = load_safetensors_header(&model)?;
+                println!("Safetensors Inspection: {}", model);
+                println!("  Header Size: {} bytes", header.header_size);
+                println!("  Tensor Count: {}", header.tensors.len());
+
+                let mut total_elements = 0usize;
+                let mut total_bytes = 0usize;
+
+                for meta in header.tensors.values() {
+                    total_elements += meta.element_count();
+                    total_bytes += meta.byte_size();
+                }
+
+                let total_mparams = (total_elements as f64) / 1_000_000.0;
+                let total_gib = (total_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+
+                println!("  Total Parameters: {:.2}M", total_mparams);
+                println!("  Raw Weight Size:  {:.2} GiB", total_gib);
+
+                if !header.metadata.is_empty() {
+                    println!("\n  Metadata:");
+                    for (k, v) in &header.metadata {
+                        println!("    {}: {}", k, v);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_size_to_bytes() {
+        assert_eq!(parse_size_to_bytes("4GB").unwrap(), 4_000_000_000);
+        assert_eq!(parse_size_to_bytes("2GiB").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_size_to_bytes("512MiB").unwrap(), 512 * 1024 * 1024);
+        assert!(parse_size_to_bytes("auto").unwrap() > 0);
+    }
+
+    #[test]
+    fn test_cli_parse_plan() {
+        let args = [
+            "quant",
+            "plan",
+            "--model",
+            "model.safetensors",
+            "--target-vram",
+            "4GB",
+        ];
+        let parsed = Cli::try_parse_from(args);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_cli_parse_inspect() {
+        let args = ["quant", "inspect", "--model", "test.gguf"];
+        let parsed = Cli::try_parse_from(args);
+        assert!(parsed.is_ok());
+    }
 }
