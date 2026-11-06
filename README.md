@@ -59,6 +59,12 @@ Inspect header metadata, tensor count, element count, and byte sizes without loa
 ./target/release/quant inspect --model /path/to/output.gguf
 ```
 
+### Hardware Probing
+Probe host compute accelerators (CUDA NVML, AMDGPU sysfs, Apple Silicon Metal unified memory) and system RAM:
+```bash
+./target/release/quant probe
+```
+
 ## Python API
 
 Install the Python bindings via `maturin`:

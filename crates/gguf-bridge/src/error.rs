@@ -28,4 +28,10 @@ pub enum BridgeError {
 
     #[error("buffer size mismatch: expected at least {expected} bytes, found {found}")]
     BufferSizeMismatch { expected: usize, found: usize },
+
+    #[error("llama-quantize binary not found: searched PATH and LLAMA_QUANTIZE_PATH")]
+    LlamaQuantizeNotFound,
+
+    #[error("llama-quantize execution failed with exit code {code:?}: {stderr}")]
+    LlamaQuantizeExecutionFailed { code: Option<i32>, stderr: String },
 }

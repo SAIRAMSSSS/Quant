@@ -102,6 +102,14 @@ def test_py_end_to_end():
         assert multi_written > 0
         assert os.path.exists(multi_out)
 
+        # Test LlamaQuantizeRunner instantiation and error handling
+        runner = quant_engine.LlamaQuantizeRunner("/non/existent/llama-quantize")
+        try:
+            runner.resolve_binary()
+            assert False, "should have failed to resolve non existent binary"
+        except (IOError, ValueError):
+            pass
+
     print("Python single-shard and multi-shard integration tests passed successfully!")
 
 if __name__ == "__main__":

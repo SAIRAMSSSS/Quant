@@ -317,11 +317,59 @@ pub fn execute_quantization(
     Ok(written)
 }
 
+#[pyclass(name = "LlamaQuantizeRunner")]
+#[derive(Clone, Default)]
+pub struct PyLlamaQuantizeRunner {
+    inner: quant_gguf_bridge::LlamaQuantizeRunner,
+}
+
+#[pymethods]
+impl PyLlamaQuantizeRunner {
+    #[new]
+    #[pyo3(signature = (binary_path=None))]
+    pub fn new(binary_path: Option<&str>) -> Self {
+        if let Some(bin) = binary_path {
+            Self {
+                inner: quant_gguf_bridge::LlamaQuantizeRunner::with_binary_path(bin),
+            }
+        } else {
+            Self {
+                inner: quant_gguf_bridge::LlamaQuantizeRunner::new(),
+            }
+        }
+    }
+
+    pub fn resolve_binary(&self) -> PyResult<String> {
+        let p = self
+            .inner
+            .resolve_binary()
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        Ok(p.to_string_lossy().to_string())
+    }
+
+    #[pyo3(signature = (input_gguf, output_gguf, quant_type, extra_args=vec![]))]
+    pub fn execute(
+        &self,
+        input_gguf: &str,
+        output_gguf: &str,
+        quant_type: &str,
+        extra_args: Vec<String>,
+    ) -> PyResult<i32> {
+        let args_ref: Vec<&str> = extra_args.iter().map(|s| s.as_str()).collect();
+        let status = self
+            .inner
+            .execute(input_gguf, output_gguf, quant_type, &args_ref)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        Ok(status.code().unwrap_or(0))
+    }
+}
+
 #[pymodule]
 fn quant_engine(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyHardwareProfile>()?;
     m.add_class::<PyQuantizationPlan>()?;
     m.add_class::<PyModelSummary>()?;
+    m.add_class::<PyLlamaQuantizeRunner>()?;
 
     m.add_function(wrap_pyfunction!(probe_hardware, m)?)?;
     m.add_function(wrap_pyfunction!(plan_quantization, m)?)?;

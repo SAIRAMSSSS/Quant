@@ -1,4 +1,5 @@
 pub mod error;
+pub mod metal;
 pub mod nvml;
 pub mod ram;
 pub mod sysfs;
@@ -11,6 +12,8 @@ pub fn probe_hardware() -> HardwareProfile {
     let mut gpus = nvml::probe_nvml_gpus();
     let amd_gpus = sysfs::probe_sysfs_amdgpu();
     gpus.extend(amd_gpus);
+    let metal_gpus = metal::probe_metal_gpus();
+    gpus.extend(metal_gpus);
 
     let system_ram = ram::probe_system_ram();
 

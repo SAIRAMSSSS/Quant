@@ -88,6 +88,9 @@ enum Commands {
         )]
         model: String,
     },
+
+    #[command(about = "Probe host hardware accelerators and available memory")]
+    Probe,
 }
 
 fn parse_size_to_bytes(s: &str) -> Result<u64> {
@@ -281,10 +284,63 @@ fn render_plan_ascii_table(plan: &QuantizationPlan) {
     println!();
 }
 
+fn render_probe_ascii_table(hw: &quant_hw_probe::HardwareProfile) {
+    println!("SYSTEM HARDWARE MEMORY PROFILE");
+    println!("System RAM:");
+    let total_ram_gib = (hw.system_ram.total_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    let avail_ram_gib = (hw.system_ram.available_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+    println!("  Total RAM:     {:>8.3} GiB", total_ram_gib);
+    println!("  Available RAM: {:>8.3} GiB", avail_ram_gib);
+
+    println!("\nDetected Accelerators:");
+    if hw.gpus.is_empty() {
+        println!("  No discrete GPU detected (falling back to system RAM budget).");
+    } else {
+        println!(
+            "+--------------------------------------------------+----------+--------------+--------------+"
+        );
+        println!(
+            "| {:<48} | {:<8} | {:>12} | {:>12} |",
+            "Device Name", "Backend", "Total VRAM", "Free VRAM"
+        );
+        println!(
+            "+--------------------------------------------------+----------+--------------+--------------+"
+        );
+        for gpu in &hw.gpus {
+            let total_vram_gib = (gpu.total_vram_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+            let free_vram_gib = (gpu.free_vram_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+            let name_trunc = if gpu.name.len() > 48 {
+                format!("{}...", &gpu.name[..45])
+            } else {
+                gpu.name.clone()
+            };
+            println!(
+                "| {:<48} | {:<8?} | {:>10.3} GiB | {:>10.3} GiB |",
+                name_trunc, gpu.backend, total_vram_gib, free_vram_gib
+            );
+        }
+        println!(
+            "+--------------------------------------------------+----------+--------------+--------------+"
+        );
+    }
+
+    println!("\nRecommended VRAM Targets:");
+    let rec10 = (hw.recommend_vram_target(0.10) as f64) / (1024.0 * 1024.0 * 1024.0);
+    let rec15 = (hw.recommend_vram_target(0.15) as f64) / (1024.0 * 1024.0 * 1024.0);
+    let rec20 = (hw.recommend_vram_target(0.20) as f64) / (1024.0 * 1024.0 * 1024.0);
+    println!("  10% Headroom Margin: {:>8.3} GiB", rec10);
+    println!("  15% Headroom Margin: {:>8.3} GiB", rec15);
+    println!("  20% Headroom Margin: {:>8.3} GiB", rec20);
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::Probe => {
+            let hw = probe_hardware();
+            render_probe_ascii_table(&hw);
+        }
         Commands::Plan {
             model,
             target_vram,
@@ -442,6 +498,13 @@ mod tests {
         let args = ["quant", "inspect", "--model", "test.gguf"];
         let parsed = Cli::try_parse_from(args);
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_cli_parse_probe() {
+        let args = ["quant", "probe"];
+        let parsed = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(parsed.command, Commands::Probe));
     }
 
     #[test]
