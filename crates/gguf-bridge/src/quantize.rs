@@ -164,6 +164,108 @@ unsafe fn quantize_block_q8_0_avx2(chunk: &[f32; 32], dst: &mut [u8]) {
     _mm_storeu_si128(dst[18..34].as_mut_ptr() as *mut __m128i, b1);
 }
 
+fn quantize_block_q4_0_scalar(chunk: &[f32; 32], dst: &mut [u8]) {
+    let mut amax = 0.0f32;
+    for &x in chunk {
+        let ax = x.abs();
+        if ax > amax {
+            amax = ax;
+        }
+    }
+
+    let d = amax / -8.0f32;
+    let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
+    let d_f16 = f16::from_f32(d);
+
+    let d_bytes = d_f16.to_le_bytes();
+    dst[0] = d_bytes[0];
+    dst[1] = d_bytes[1];
+
+    for i in 0..16 {
+        let v0 = (chunk[i] * id).round();
+        let q0 = ((v0 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
+
+        let v1 = (chunk[i + 16] * id).round();
+        let q1 = ((v1 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
+
+        dst[2 + i] = q0 | (q1 << 4);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_block_q4_0_avx2(chunk: &[f32; 32], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let v0 = _mm256_loadu_ps(chunk.as_ptr());
+    let v1 = _mm256_loadu_ps(chunk.as_ptr().add(8));
+    let v2 = _mm256_loadu_ps(chunk.as_ptr().add(16));
+    let v3 = _mm256_loadu_ps(chunk.as_ptr().add(24));
+
+    let sign_mask = _mm256_set1_ps(-0.0f32);
+    let a0 = _mm256_andnot_ps(sign_mask, v0);
+    let a1 = _mm256_andnot_ps(sign_mask, v1);
+    let a2 = _mm256_andnot_ps(sign_mask, v2);
+    let a3 = _mm256_andnot_ps(sign_mask, v3);
+
+    let m01 = _mm256_max_ps(a0, a1);
+    let m23 = _mm256_max_ps(a2, a3);
+    let m = _mm256_max_ps(m01, m23);
+
+    let hi128 = _mm256_extractf128_ps(m, 1);
+    let lo128 = _mm256_castps256_ps128(m);
+    let m128 = _mm_max_ps(lo128, hi128);
+    let shuf1 = _mm_movehl_ps(m128, m128);
+    let m64 = _mm_max_ps(m128, shuf1);
+    let shuf2 = _mm_shuffle_ps(m64, m64, 1);
+    let amax = _mm_cvtss_f32(_mm_max_ss(m64, shuf2));
+
+    let d = amax / -8.0f32;
+    let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
+    let d_f16 = f16::from_f32(d);
+
+    let d_bytes = d_f16.to_le_bytes();
+    dst[0] = d_bytes[0];
+    dst[1] = d_bytes[1];
+
+    let v_id = _mm256_set1_ps(id);
+    let v_offset = _mm256_set1_ps(8.5f32);
+    let v_zero = _mm256_setzero_ps();
+    let v_max = _mm256_set1_ps(15.0f32);
+
+    let quantize_8 = |vec: __m256| -> [u8; 8] {
+        let rounded = _mm256_round_ps(
+            _mm256_mul_ps(vec, v_id),
+            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+        );
+        let shifted = _mm256_add_ps(rounded, v_offset);
+        let clamped = _mm256_min_ps(_mm256_max_ps(shifted, v_zero), v_max);
+        let ints = _mm256_cvttps_epi32(clamped);
+        let mut buf = [0i32; 8];
+        _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, ints);
+        [
+            (buf[0] as u8) & 0x0F,
+            (buf[1] as u8) & 0x0F,
+            (buf[2] as u8) & 0x0F,
+            (buf[3] as u8) & 0x0F,
+            (buf[4] as u8) & 0x0F,
+            (buf[5] as u8) & 0x0F,
+            (buf[6] as u8) & 0x0F,
+            (buf[7] as u8) & 0x0F,
+        ]
+    };
+
+    let q0_7 = quantize_8(v0);
+    let q8_15 = quantize_8(v1);
+    let q16_23 = quantize_8(v2);
+    let q24_31 = quantize_8(v3);
+
+    for i in 0..8 {
+        dst[2 + i] = q0_7[i] | (q16_23[i] << 4);
+        dst[2 + 8 + i] = q8_15[i] | (q24_31[i] << 4);
+    }
+}
+
 pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) -> Result<usize, BridgeError> {
     if !src.len().is_multiple_of(32) {
         return Err(BridgeError::QuantizeError(format!(
@@ -181,36 +283,21 @@ pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) -> Result<usize, Bridge
         });
     }
 
-    let mut dst_ptr = 0usize;
-
-    for chunk in src.as_chunks::<32>().0 {
-        let mut amax = 0.0f32;
-        for &x in chunk {
-            let ax = x.abs();
-            if ax > amax {
-                amax = ax;
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            for (idx, chunk) in src.as_chunks::<32>().0.iter().enumerate() {
+                // SAFETY: CPU supports avx2 and fma, slice has exact 32 elements, dst has 18 bytes.
+                unsafe {
+                    quantize_block_q4_0_avx2(chunk, &mut dst[idx * 18..(idx + 1) * 18]);
+                }
             }
+            return Ok(required);
         }
+    }
 
-        let d = amax / -8.0f32;
-        let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
-        let d_f16 = f16::from_f32(d);
-
-        let d_bytes = d_f16.to_le_bytes();
-        dst[dst_ptr] = d_bytes[0];
-        dst[dst_ptr + 1] = d_bytes[1];
-        dst_ptr += 2;
-
-        for i in 0..16 {
-            let v0 = (chunk[i] * id).round();
-            let q0 = ((v0 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
-
-            let v1 = (chunk[i + 16] * id).round();
-            let q1 = ((v1 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
-
-            dst[dst_ptr] = q0 | (q1 << 4);
-            dst_ptr += 1;
-        }
+    for (idx, chunk) in src.as_chunks::<32>().0.iter().enumerate() {
+        quantize_block_q4_0_scalar(chunk, &mut dst[idx * 18..(idx + 1) * 18]);
     }
 
     Ok(required)
@@ -697,5 +784,29 @@ mod tests {
 
         assert_eq!(dst_avx[0..2], dst_scalar[0..2]);
         assert_eq!(&dst_avx[2..34], &dst_scalar[2..34]);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_quantize_q4_0_avx2_scalar_parity() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let mut src = [0.0f32; 32];
+        for (i, val) in src.iter_mut().enumerate() {
+            *val = ((i as f32) - 15.5) * 1.7;
+        }
+
+        let mut dst_avx = [0u8; 18];
+        unsafe {
+            quantize_block_q4_0_avx2(&src, &mut dst_avx);
+        }
+
+        let mut dst_scalar = [0u8; 18];
+        quantize_block_q4_0_scalar(&src, &mut dst_scalar);
+
+        assert_eq!(dst_avx[0..2], dst_scalar[0..2]);
+        assert_eq!(&dst_avx[2..18], &dst_scalar[2..18]);
     }
 }

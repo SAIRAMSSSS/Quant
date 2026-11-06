@@ -47,12 +47,20 @@ def test_py_end_to_end():
 
         plan = quant_engine.plan_quantization(st_path, 10 * 1024 * 1024, ctx_size=2048, kv_type="q4_0", overhead_mb=1)
         assert plan.total_vram_bytes <= 10 * 1024 * 1024
+        assert plan.target_vram_bytes == 10 * 1024 * 1024
         assert len(plan.assignments) == 2
+        mix = plan.quantization_mixture()
+        assert len(mix) > 0
 
         written = quant_engine.execute_quantization(st_path, out_gguf, plan)
         assert written > 0
         assert os.path.exists(out_gguf)
         assert os.path.getsize(out_gguf) > 0
+
+        # Verify GGUF inspection in Python
+        gguf_summary = quant_engine.inspect_model(out_gguf)
+        assert gguf_summary.tensor_count == 2
+        assert gguf_summary.total_elements == 512
 
         # Multi-shard test
         shard_dir = os.path.join(tmpdir, "sharded")

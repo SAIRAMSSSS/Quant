@@ -773,6 +773,7 @@ dependencies = [
  "quant-hw-probe",
  "serde",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

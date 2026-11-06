@@ -39,6 +39,8 @@ impl PyHardwareProfile {
 #[derive(Clone)]
 pub struct PyQuantizationPlan {
     #[pyo3(get)]
+    pub target_vram_bytes: usize,
+    #[pyo3(get)]
     pub total_weight_bytes: usize,
     #[pyo3(get)]
     pub kv_cache_bytes: usize,
@@ -59,6 +61,15 @@ pub struct PyQuantizationPlan {
 impl PyQuantizationPlan {
     pub fn get_type(&self, tensor_name: &str) -> Option<String> {
         self.assignments.get(tensor_name).cloned()
+    }
+
+    pub fn quantization_mixture(&self) -> HashMap<String, usize> {
+        let hist = self.inner_plan.type_histogram();
+        let mut map = HashMap::new();
+        for (k, v) in hist {
+            map.insert(k.as_str().to_string(), v);
+        }
+        map
     }
 }
 
@@ -106,7 +117,7 @@ pub fn probe_hardware() -> PyResult<PyHardwareProfile> {
 }
 
 #[pyfunction]
-#[pyo3(signature = (model_path, target_vram_bytes, ctx_size=4096, kv_type="f16", overhead_mb=512))]
+#[pyo3(signature = (model_path, target_vram_bytes=0, ctx_size=4096, kv_type="f16", overhead_mb=512))]
 pub fn plan_quantization(
     model_path: &str,
     target_vram_bytes: u64,
@@ -114,22 +125,30 @@ pub fn plan_quantization(
     kv_type: &str,
     overhead_mb: usize,
 ) -> PyResult<PyQuantizationPlan> {
-    let path = Path::new(model_path);
-    if !path.exists() {
-        return Err(PyIOError::new_err(format!(
-            "model file not found: {model_path}"
-        )));
-    }
-
-    let (tensors, _metadata) = if path.is_dir()
-        || path.file_name().and_then(|s| s.to_str()) == Some("model.safetensors.index.json")
+    let (tensors, _metadata) = if model_path.starts_with("http://")
+        || model_path.starts_with("https://")
     {
-        let multi = quant_core::load_multi_shard_headers(path)
+        let header = quant_core::safetensors::fetch_remote_header(model_path)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
-        (multi.combined_tensors, multi.combined_metadata)
-    } else {
-        let header = parse_from_file(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
         (header.tensors, header.metadata)
+    } else {
+        let path = Path::new(model_path);
+        if !path.exists() {
+            return Err(PyIOError::new_err(format!(
+                "model file not found: {model_path}"
+            )));
+        }
+
+        if path.is_dir()
+            || path.file_name().and_then(|s| s.to_str()) == Some("model.safetensors.index.json")
+        {
+            let multi = quant_core::load_multi_shard_headers(path)
+                .map_err(|e| PyValueError::new_err(e.to_string()))?;
+            (multi.combined_tensors, multi.combined_metadata)
+        } else {
+            let header = parse_from_file(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+            (header.tensors, header.metadata)
+        }
     };
 
     let mut tensor_map = HashMap::with_capacity(tensors.len());
@@ -139,6 +158,13 @@ pub fn plan_quantization(
 
     let kv_enum = GgmlType::from_str_case_insensitive(kv_type).unwrap_or(GgmlType::F16);
     let overhead_bytes = overhead_mb * 1024 * 1024;
+
+    let target_bytes = if target_vram_bytes == 0 {
+        let hw = probe_hw_inner();
+        hw.recommend_vram_target(0.10) as usize
+    } else {
+        target_vram_bytes as usize
+    };
 
     let mut n_layers = 0usize;
     let n_kv_heads = 8usize;
@@ -173,13 +199,8 @@ pub fn plan_quantization(
 
     let groups = MckpSolver::build_tensor_groups(&tensor_map)
         .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let plan = MckpSolver::solve(
-        &groups,
-        target_vram_bytes as usize,
-        kv_bytes,
-        overhead_bytes,
-    )
-    .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let plan = MckpSolver::solve(&groups, target_bytes, kv_bytes, overhead_bytes)
+        .map_err(|e| PyValueError::new_err(e.to_string()))?;
 
     let mut assignments = HashMap::new();
     for p in &plan.tensor_plans {
@@ -187,6 +208,7 @@ pub fn plan_quantization(
     }
 
     Ok(PyQuantizationPlan {
+        target_vram_bytes: plan.target_vram_bytes,
         total_weight_bytes: plan.total_weight_bytes,
         kv_cache_bytes: plan.kv_cache_bytes,
         overhead_bytes: plan.overhead_bytes,
@@ -200,11 +222,59 @@ pub fn plan_quantization(
 
 #[pyfunction]
 pub fn inspect_model(model_path: &str) -> PyResult<PyModelSummary> {
+    if model_path.starts_with("http://") || model_path.starts_with("https://") {
+        let header = quant_core::safetensors::fetch_remote_header(model_path)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let mut total_elements = 0usize;
+        let mut total_bytes = 0usize;
+        for meta in header.tensors.values() {
+            total_elements += meta.element_count();
+            total_bytes += meta.byte_size();
+        }
+
+        return Ok(PyModelSummary {
+            header_size: header.header_size,
+            tensor_count: header.tensors.len(),
+            total_elements,
+            total_bytes,
+            metadata: header.metadata,
+        });
+    }
+
     let path = Path::new(model_path);
     if !path.exists() {
         return Err(PyIOError::new_err(format!(
             "model file not found: {model_path}"
         )));
+    }
+
+    if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+        let gguf = quant_gguf_bridge::reader::inspect_gguf_file(path)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+
+        let mut total_elements = 0usize;
+        let mut total_bytes = 0usize;
+        for t in &gguf.tensors {
+            let elems: usize = t.dimensions.iter().map(|&d| d as usize).product();
+            total_elements += elems;
+            if let Ok(bytes) = t.ggml_type.bytes_for_elements(elems) {
+                total_bytes += bytes;
+            }
+        }
+
+        let mut meta_str_map = HashMap::new();
+        for (k, v) in &gguf.metadata {
+            meta_str_map.insert(k.clone(), format!("{v:?}"));
+        }
+
+        return Ok(PyModelSummary {
+            header_size: gguf.data_offset,
+            tensor_count: gguf.tensors.len(),
+            total_elements,
+            total_bytes,
+            metadata: meta_str_map,
+        });
     }
 
     let (tensors, metadata, header_size) = if path.is_dir()
