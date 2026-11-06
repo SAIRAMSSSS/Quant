@@ -40,6 +40,19 @@ pub fn quantize_f32_to_q8_0(src: &[f32], dst: &mut [u8]) -> Result<usize, Bridge
         });
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            for (idx, chunk) in src.as_chunks::<32>().0.iter().enumerate() {
+                // SAFETY: CPU supports avx2 and fma, slice has exact 32 elements, dst has 34 bytes.
+                unsafe {
+                    quantize_block_q8_0_avx2(chunk, &mut dst[idx * 34..(idx + 1) * 34]);
+                }
+            }
+            return Ok(required);
+        }
+    }
+
     let mut dst_ptr = 0usize;
 
     for chunk in src.as_chunks::<32>().0 {
@@ -69,6 +82,86 @@ pub fn quantize_f32_to_q8_0(src: &[f32], dst: &mut [u8]) -> Result<usize, Bridge
     }
 
     Ok(required)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn quantize_block_q8_0_avx2(chunk: &[f32; 32], dst: &mut [u8]) {
+    use std::arch::x86_64::*;
+
+    let v0 = _mm256_loadu_ps(chunk.as_ptr());
+    let v1 = _mm256_loadu_ps(chunk.as_ptr().add(8));
+    let v2 = _mm256_loadu_ps(chunk.as_ptr().add(16));
+    let v3 = _mm256_loadu_ps(chunk.as_ptr().add(24));
+
+    let sign_mask = _mm256_set1_ps(-0.0f32);
+    let a0 = _mm256_andnot_ps(sign_mask, v0);
+    let a1 = _mm256_andnot_ps(sign_mask, v1);
+    let a2 = _mm256_andnot_ps(sign_mask, v2);
+    let a3 = _mm256_andnot_ps(sign_mask, v3);
+
+    let m01 = _mm256_max_ps(a0, a1);
+    let m23 = _mm256_max_ps(a2, a3);
+    let m = _mm256_max_ps(m01, m23);
+
+    let hi128 = _mm256_extractf128_ps(m, 1);
+    let lo128 = _mm256_castps256_ps128(m);
+    let m128 = _mm_max_ps(lo128, hi128);
+    let shuf1 = _mm_movehl_ps(m128, m128);
+    let m64 = _mm_max_ps(m128, shuf1);
+    let shuf2 = _mm_shuffle_ps(m64, m64, 1);
+    let amax = _mm_cvtss_f32(_mm_max_ss(m64, shuf2));
+
+    let d = amax / 127.0f32;
+    let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
+    let d_f16 = f16::from_f32(d);
+
+    let d_bytes = d_f16.to_le_bytes();
+    dst[0] = d_bytes[0];
+    dst[1] = d_bytes[1];
+
+    let v_id = _mm256_set1_ps(id);
+    let q0 = _mm256_round_ps(
+        _mm256_mul_ps(v0, v_id),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+    );
+    let q1 = _mm256_round_ps(
+        _mm256_mul_ps(v1, v_id),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+    );
+    let q2 = _mm256_round_ps(
+        _mm256_mul_ps(v2, v_id),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+    );
+    let q3 = _mm256_round_ps(
+        _mm256_mul_ps(v3, v_id),
+        _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
+    );
+
+    let i0 = _mm256_cvtps_epi32(q0);
+    let i1 = _mm256_cvtps_epi32(q1);
+    let i2 = _mm256_cvtps_epi32(q2);
+    let i3 = _mm256_cvtps_epi32(q3);
+
+    let lo0 = _mm256_castsi256_si128(i0);
+    let hi0 = _mm256_extracti128_si256(i0, 1);
+    let lo1 = _mm256_castsi256_si128(i1);
+    let hi1 = _mm256_extracti128_si256(i1, 1);
+    let lo2 = _mm256_castsi256_si128(i2);
+    let hi2 = _mm256_extracti128_si256(i2, 1);
+    let lo3 = _mm256_castsi256_si128(i3);
+    let hi3 = _mm256_extracti128_si256(i3, 1);
+
+    let s0 = _mm_packs_epi32(lo0, hi0);
+    let s1 = _mm_packs_epi32(lo1, hi1);
+    let s2 = _mm_packs_epi32(lo2, hi2);
+    let s3 = _mm_packs_epi32(lo3, hi3);
+
+    let b0 = _mm_packs_epi16(s0, s1);
+    let b1 = _mm_packs_epi16(s2, s3);
+
+    _mm_storeu_si128(dst[2..18].as_mut_ptr() as *mut __m128i, b0);
+    _mm_storeu_si128(dst[18..34].as_mut_ptr() as *mut __m128i, b1);
 }
 
 pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) -> Result<usize, BridgeError> {
@@ -562,5 +655,47 @@ mod tests {
 
         let mut dst_q3k = vec![0u8; 110];
         assert_eq!(quantize_f32_to_q3_k(&src, &mut dst_q3k).unwrap(), 110);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_quantize_q8_0_avx2_scalar_parity() {
+        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
+            return;
+        }
+
+        let mut src = [0.0f32; 32];
+        for (i, val) in src.iter_mut().enumerate() {
+            *val = ((i as f32) - 15.5) * 1.7;
+        }
+
+        let mut dst_avx = [0u8; 34];
+        unsafe {
+            quantize_block_q8_0_avx2(&src, &mut dst_avx);
+        }
+
+        let mut amax = 0.0f32;
+        for &x in &src {
+            let ax = x.abs();
+            if ax > amax {
+                amax = ax;
+            }
+        }
+        let d = amax / 127.0f32;
+        let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
+        let d_f16 = f16::from_f32(d);
+        let d_bytes = d_f16.to_le_bytes();
+
+        let mut dst_scalar = [0u8; 34];
+        dst_scalar[0] = d_bytes[0];
+        dst_scalar[1] = d_bytes[1];
+        for i in 0..32 {
+            let v = (src[i] * id).round();
+            let q = v.clamp(-128.0, 127.0) as i8;
+            dst_scalar[2 + i] = q as u8;
+        }
+
+        assert_eq!(dst_avx[0..2], dst_scalar[0..2]);
+        assert_eq!(&dst_avx[2..34], &dst_scalar[2..34]);
     }
 }

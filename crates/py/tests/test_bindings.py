@@ -54,7 +54,47 @@ def test_py_end_to_end():
         assert os.path.exists(out_gguf)
         assert os.path.getsize(out_gguf) > 0
 
-    print("Python end-to-end integration test passed successfully!")
+        # Multi-shard test
+        shard_dir = os.path.join(tmpdir, "sharded")
+        os.makedirs(shard_dir, exist_ok=True)
+        s1 = os.path.join(shard_dir, "model-00001-of-00002.safetensors")
+        s2 = os.path.join(shard_dir, "model-00002-of-00002.safetensors")
+        idx = os.path.join(shard_dir, "model.safetensors.index.json")
+
+        s1_meta = {"model.embed_tokens.weight": {"dtype": "F16", "shape": [16, 16], "data_offsets": [0, 512]}}
+        s1_json = json.dumps(s1_meta).encode("utf-8")
+        with open(s1, "wb") as f:
+            f.write(struct.pack("<Q", len(s1_json)))
+            f.write(s1_json)
+            f.write(bytes(512))
+
+        s2_meta = {"lm_head.weight": {"dtype": "F16", "shape": [16, 16], "data_offsets": [0, 512]}}
+        s2_json = json.dumps(s2_meta).encode("utf-8")
+        with open(s2, "wb") as f:
+            f.write(struct.pack("<Q", len(s2_json)))
+            f.write(s2_json)
+            f.write(bytes(512))
+
+        index_data = {
+            "metadata": {"total_size": 1024},
+            "weight_map": {
+                "model.embed_tokens.weight": "model-00001-of-00002.safetensors",
+                "lm_head.weight": "model-00002-of-00002.safetensors"
+            }
+        }
+        with open(idx, "w") as f:
+            json.dump(index_data, f)
+
+        multi_summary = quant_engine.inspect_model(shard_dir)
+        assert multi_summary.tensor_count == 2
+
+        multi_plan = quant_engine.plan_quantization(shard_dir, 100 * 1024 * 1024, ctx_size=2048, kv_type="q4_0", overhead_mb=1)
+        multi_out = os.path.join(tmpdir, "multi.gguf")
+        multi_written = quant_engine.execute_quantization(shard_dir, multi_out, multi_plan)
+        assert multi_written > 0
+        assert os.path.exists(multi_out)
+
+    print("Python single-shard and multi-shard integration tests passed successfully!")
 
 if __name__ == "__main__":
     test_py_end_to_end()

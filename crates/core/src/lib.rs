@@ -12,6 +12,8 @@ pub use mckp::{
 };
 pub use page_aligned::{align_to_page, PAGE_SIZE};
 pub use safetensors::{
-    fetch_remote_header, parse_from_file, parse_header_bytes, SafetensorsHeader, TensorMetadata,
+    fetch_remote_header, load_multi_shard_headers, parse_from_file, parse_header_bytes,
+    parse_index_bytes, parse_index_file, MultiShardHeader, SafetensorsHeader, SafetensorsIndex,
+    TensorMetadata,
 };
 pub use types::{BlockQ4_0, BlockQ4_K, BlockQ8_0, GgmlType};

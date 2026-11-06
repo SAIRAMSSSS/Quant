@@ -43,4 +43,10 @@ pub enum CoreError {
 
     #[error("empty tensor group or missing quantization candidates for: {0}")]
     MissingCandidates(String),
+
+    #[error("safetensors index error: {0}")]
+    SafetensorsIndexError(String),
+
+    #[error("safetensors shard file not found: {0}")]
+    SafetensorsShardNotFound(String),
 }

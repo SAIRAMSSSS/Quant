@@ -121,9 +121,19 @@ pub fn plan_quantization(
         )));
     }
 
-    let header = parse_from_file(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let mut tensor_map = HashMap::with_capacity(header.tensors.len());
-    for (k, v) in &header.tensors {
+    let (tensors, _metadata) = if path.is_dir()
+        || path.file_name().and_then(|s| s.to_str()) == Some("model.safetensors.index.json")
+    {
+        let multi = quant_core::load_multi_shard_headers(path)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        (multi.combined_tensors, multi.combined_metadata)
+    } else {
+        let header = parse_from_file(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        (header.tensors, header.metadata)
+    };
+
+    let mut tensor_map = HashMap::with_capacity(tensors.len());
+    for (k, v) in &tensors {
         tensor_map.insert(k.clone(), (v.shape.clone(), v.element_count()));
     }
 
@@ -134,7 +144,7 @@ pub fn plan_quantization(
     let n_kv_heads = 8usize;
     let mut head_dim = 128usize;
 
-    for (name, meta) in &header.tensors {
+    for (name, meta) in &tensors {
         if name.contains("layers.") {
             let parts: Vec<&str> = name.split('.').collect();
             for (idx, &part) in parts.iter().enumerate() {
@@ -197,21 +207,31 @@ pub fn inspect_model(model_path: &str) -> PyResult<PyModelSummary> {
         )));
     }
 
-    let header = parse_from_file(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+    let (tensors, metadata, header_size) = if path.is_dir()
+        || path.file_name().and_then(|s| s.to_str()) == Some("model.safetensors.index.json")
+    {
+        let multi = quant_core::load_multi_shard_headers(path)
+            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+        (multi.combined_tensors, multi.combined_metadata, 0u64)
+    } else {
+        let header = parse_from_file(path).map_err(|e| PyValueError::new_err(e.to_string()))?;
+        (header.tensors, header.metadata, header.header_size)
+    };
+
     let mut total_elements = 0usize;
     let mut total_bytes = 0usize;
 
-    for meta in header.tensors.values() {
+    for meta in tensors.values() {
         total_elements += meta.element_count();
         total_bytes += meta.byte_size();
     }
 
     Ok(PyModelSummary {
-        header_size: header.header_size,
-        tensor_count: header.tensors.len(),
+        header_size,
+        tensor_count: tensors.len(),
         total_elements,
         total_bytes,
-        metadata: header.metadata,
+        metadata,
     })
 }
 

@@ -168,8 +168,20 @@ fn load_safetensors_header(target: &str) -> Result<SafetensorsHeader> {
         if !path.exists() {
             bail!("input file not found: {}", target);
         }
-        let hdr = parse_from_file(path).context("failed to parse local safetensors header")?;
-        Ok(hdr)
+        if path.is_dir()
+            || path.file_name().and_then(|s| s.to_str()) == Some("model.safetensors.index.json")
+        {
+            let multi = quant_core::load_multi_shard_headers(path)
+                .context("failed to load multi-shard safetensors headers")?;
+            Ok(SafetensorsHeader {
+                tensors: multi.combined_tensors,
+                metadata: multi.combined_metadata,
+                header_size: 0,
+            })
+        } else {
+            let hdr = parse_from_file(path).context("failed to parse local safetensors header")?;
+            Ok(hdr)
+        }
     }
 }
 
@@ -315,7 +327,7 @@ fn main() -> Result<()> {
             let overhead_bytes = overhead_mb * 1024 * 1024;
 
             println!("Generating quantization plan for: {}", model.display());
-            let header = parse_from_file(&model)?;
+            let header = load_safetensors_header(&model.to_string_lossy())?;
             let tensor_map = extract_model_tensors_map(&header);
             let kv_bytes = estimate_kv_cache(&header, ctx_size, kv_enum);
 
@@ -430,5 +442,21 @@ mod tests {
         let args = ["quant", "inspect", "--model", "test.gguf"];
         let parsed = Cli::try_parse_from(args);
         assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_load_safetensors_header_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s1_path = tmp.path().join("model-00001-of-00001.safetensors");
+        let s1_json = r#"{"model.embed_tokens.weight":{"dtype":"F16","shape":[16,16],"data_offsets":[0,512]}}"#;
+        let mut s1_buf = Vec::new();
+        s1_buf.extend_from_slice(&(s1_json.len() as u64).to_le_bytes());
+        s1_buf.extend_from_slice(s1_json.as_bytes());
+        s1_buf.extend_from_slice(&vec![0u8; 512]);
+        std::fs::write(&s1_path, s1_buf).unwrap();
+
+        let hdr = load_safetensors_header(tmp.path().to_str().unwrap()).unwrap();
+        assert_eq!(hdr.tensors.len(), 1);
+        assert!(hdr.tensors.contains_key("model.embed_tokens.weight"));
     }
 }
