@@ -15,6 +15,7 @@ pub enum TensorRole {
     MlpDown,
     LayerNorm,
     LmHead,
+    Bias,
     Other,
 }
 
@@ -26,14 +27,14 @@ impl TensorRole {
             Self::AttentionQ | Self::AttentionK | Self::AttentionV | Self::AttentionOutput => 1.3,
             Self::MlpDown => 1.25,
             Self::MlpGate | Self::MlpUp => 1.0,
-            Self::LayerNorm => 100.0,
+            Self::LayerNorm | Self::Bias => 100.0,
             Self::Other => 1.0,
         }
     }
 
     pub fn allowed_types(&self) -> &'static [GgmlType] {
         match self {
-            Self::LayerNorm => &[GgmlType::F16, GgmlType::F32],
+            Self::LayerNorm | Self::Bias => &[GgmlType::F32],
             Self::LmHead => &[
                 GgmlType::Q8_0,
                 GgmlType::Q6_K,
@@ -56,6 +57,7 @@ impl TensorRole {
                 GgmlType::Q4_0,
             ],
             Self::MlpDown => &[
+                GgmlType::Q8_0,
                 GgmlType::Q6_K,
                 GgmlType::Q5_K,
                 GgmlType::Q4_K,
@@ -63,6 +65,7 @@ impl TensorRole {
                 GgmlType::Q3_K,
             ],
             Self::MlpGate | Self::MlpUp => &[
+                GgmlType::Q8_0,
                 GgmlType::Q6_K,
                 GgmlType::Q5_K,
                 GgmlType::Q4_K,
@@ -84,25 +87,31 @@ impl TensorRole {
 
 pub fn classify_tensor_role(name: &str) -> TensorRole {
     let lower = name.to_ascii_lowercase();
-    if lower.contains("norm") || lower.contains("ln_") || lower.contains("layernorm") {
+    if lower.contains("bias") {
+        TensorRole::Bias
+    } else if lower.contains("norm") || lower.contains("ln_") || lower.contains("layernorm") {
         TensorRole::LayerNorm
     } else if lower.contains("lm_head") || lower.contains("output.weight") {
         TensorRole::LmHead
-    } else if lower.contains("embed") || lower.contains("wte") {
+    } else if lower.contains("embed") || lower.contains("token_embd") || lower.contains("wte") {
         TensorRole::Embedding
-    } else if lower.contains("q_proj") || lower.contains("wq") {
+    } else if lower.contains("q_proj") || lower.contains("attn_q") || lower.contains("wq") {
         TensorRole::AttentionQ
-    } else if lower.contains("k_proj") || lower.contains("wk") {
+    } else if lower.contains("k_proj") || lower.contains("attn_k") || lower.contains("wk") {
         TensorRole::AttentionK
-    } else if lower.contains("v_proj") || lower.contains("wv") {
+    } else if lower.contains("v_proj") || lower.contains("attn_v") || lower.contains("wv") {
         TensorRole::AttentionV
-    } else if lower.contains("o_proj") || lower.contains("wo") || lower.contains("dense") {
+    } else if lower.contains("o_proj")
+        || lower.contains("attn_output")
+        || lower.contains("wo")
+        || lower.contains("dense")
+    {
         TensorRole::AttentionOutput
-    } else if lower.contains("gate_proj") || lower.contains("w1") {
+    } else if lower.contains("gate_proj") || lower.contains("ffn_gate") || lower.contains("w1") {
         TensorRole::MlpGate
-    } else if lower.contains("up_proj") || lower.contains("w3") {
+    } else if lower.contains("up_proj") || lower.contains("ffn_up") || lower.contains("w3") {
         TensorRole::MlpUp
-    } else if lower.contains("down_proj") || lower.contains("w2") {
+    } else if lower.contains("down_proj") || lower.contains("ffn_down") || lower.contains("w2") {
         TensorRole::MlpDown
     } else {
         TensorRole::Other
@@ -175,12 +184,22 @@ impl MckpSolver {
         let mut groups = Vec::with_capacity(tensors.len());
 
         for (name, (shape, num_elements)) in tensors {
+            let is_1d = shape.len() <= 1;
             let role = classify_tensor_role(name);
-            let allowed = role.allowed_types();
+            let allowed: &[GgmlType] = if is_1d {
+                &[GgmlType::F32]
+            } else {
+                role.allowed_types()
+            };
             let sensitivity = role.sensitivity();
+            let row_len = shape.last().copied().unwrap_or(0);
 
             let mut candidates = Vec::new();
             for &qtype in allowed {
+                if row_len > 0 && !row_len.is_multiple_of(qtype.block_size()) {
+                    continue;
+                }
+
                 if let Ok(size_bytes) = qtype.bytes_for_elements(*num_elements) {
                     let base_err = qtype.base_distortion();
                     let distortion = sensitivity * base_err * (*num_elements as f64);
@@ -189,6 +208,26 @@ impl MckpSolver {
                         size_bytes,
                         distortion,
                     });
+                }
+            }
+
+            if candidates.is_empty() {
+                let fallbacks: &[GgmlType] = if is_1d {
+                    &[GgmlType::F32]
+                } else {
+                    &[GgmlType::Q8_0, GgmlType::Q4_0, GgmlType::F16]
+                };
+                for &fallback in fallbacks {
+                    if row_len == 0 || row_len.is_multiple_of(fallback.block_size()) {
+                        if let Ok(size_bytes) = fallback.bytes_for_elements(*num_elements) {
+                            let base_err = fallback.base_distortion();
+                            candidates.push(CandidateOption {
+                                quant_type: fallback,
+                                size_bytes,
+                                distortion: sensitivity * base_err * (*num_elements as f64),
+                            });
+                        }
+                    }
                 }
             }
 
@@ -396,6 +435,10 @@ mod tests {
             TensorRole::AttentionQ
         );
         assert_eq!(
+            classify_tensor_role("model.layers.0.self_attn.k_proj.bias"),
+            TensorRole::Bias
+        );
+        assert_eq!(
             classify_tensor_role("model.layers.0.mlp.down_proj.weight"),
             TensorRole::MlpDown
         );
@@ -441,7 +484,7 @@ mod tests {
         assert_eq!(
             plan.get_type_for_tensor("model.layers.0.input_layernorm.weight")
                 .unwrap(),
-            GgmlType::F16
+            GgmlType::F32
         );
     }
 

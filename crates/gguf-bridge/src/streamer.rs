@@ -1,7 +1,7 @@
 use crate::constants::GGUF_DEFAULT_ALIGNMENT;
 use crate::error::BridgeError;
 use crate::metadata::GgufValue;
-use crate::quantize::quantize_raw_tensor;
+use crate::quantize::quantize_raw_tensor_with_permute;
 use crate::tensor_info::GgufTensorInfo;
 use crate::writer::GgufWriter;
 use quant_core::mckp::QuantizationPlan;
@@ -11,6 +11,58 @@ use quant_core::types::GgmlType;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
+
+#[derive(Debug, Clone)]
+struct EmitTensorItem {
+    source_name: String,
+    gguf_name: String,
+}
+
+pub fn map_hf_to_gguf_tensor_name(hf_name: &str) -> String {
+    if hf_name == "model.embed_tokens.weight" {
+        return "token_embd.weight".to_string();
+    }
+    if hf_name == "model.norm.weight" {
+        return "output_norm.weight".to_string();
+    }
+    if hf_name == "lm_head.weight" {
+        return "output.weight".to_string();
+    }
+
+    if let Some(rest) = hf_name.strip_prefix("model.layers.") {
+        if let Some((layer_idx_str, sub)) = rest.split_once('.') {
+            if let Ok(layer_idx) = layer_idx_str.parse::<usize>() {
+                let mapped_sub = match sub {
+                    "input_layernorm.weight" => "attn_norm.weight",
+                    "post_attention_layernorm.weight" => "ffn_norm.weight",
+                    "self_attn.q_proj.weight" => "attn_q.weight",
+                    "self_attn.q_proj.bias" => "attn_q.bias",
+                    "self_attn.k_proj.weight" => "attn_k.weight",
+                    "self_attn.k_proj.bias" => "attn_k.bias",
+                    "self_attn.v_proj.weight" => "attn_v.weight",
+                    "self_attn.v_proj.bias" => "attn_v.bias",
+                    "self_attn.o_proj.weight" => "attn_output.weight",
+                    "mlp.gate_proj.weight" => "ffn_gate.weight",
+                    "mlp.up_proj.weight" => "ffn_up.weight",
+                    "mlp.down_proj.weight" => "ffn_down.weight",
+                    other => other,
+                };
+                return format!("blk.{layer_idx}.{mapped_sub}");
+            }
+        }
+    }
+
+    hf_name.to_string()
+}
+
+#[derive(Debug, Default)]
+struct ConfigMeta {
+    metadata: HashMap<String, GgufValue>,
+    vocab_size: Option<usize>,
+    n_attn_heads: Option<usize>,
+    n_kv_heads: Option<usize>,
+    rope_is_neox: bool,
+}
 
 pub struct StreamQuantizer;
 
@@ -33,26 +85,47 @@ impl StreamQuantizer {
         let header = parse_header_bytes(&mmap)?;
         let data_start_offset = 8usize.saturating_add(header.header_size as usize);
 
-        let mut tensor_names: Vec<String> = header.tensors.keys().cloned().collect();
-        tensor_names.sort();
+        let mut sorted_sources: Vec<String> = header.tensors.keys().cloned().collect();
+        sorted_sources.sort();
 
-        let mut tensor_infos = Vec::with_capacity(tensor_names.len());
+        let mut emit_items = Vec::with_capacity(sorted_sources.len() + 1);
+        if !header.tensors.contains_key("lm_head.weight")
+            && header.tensors.contains_key("model.embed_tokens.weight")
+        {
+            emit_items.push(EmitTensorItem {
+                source_name: "model.embed_tokens.weight".to_string(),
+                gguf_name: "output.weight".to_string(),
+            });
+        }
+
+        for src in sorted_sources {
+            let gguf_name = map_hf_to_gguf_tensor_name(&src);
+            emit_items.push(EmitTensorItem {
+                source_name: src,
+                gguf_name,
+            });
+        }
+
+        let mut tensor_infos = Vec::with_capacity(emit_items.len());
         let mut running_data_offset = 0u64;
 
-        for name in &tensor_names {
-            let meta = match header.tensors.get(name) {
+        for item in &emit_items {
+            let meta = match header.tensors.get(&item.source_name) {
                 Some(m) => m,
                 None => continue,
             };
 
-            let target_type = plan.get_type_for_tensor(name).unwrap_or(GgmlType::F16);
+            let target_type = plan
+                .get_type_for_tensor(&item.gguf_name)
+                .or_else(|| plan.get_type_for_tensor(&item.source_name))
+                .unwrap_or(GgmlType::F16);
             let elem_count = meta.element_count();
             let size_bytes = target_type.bytes_for_elements(elem_count)? as u64;
 
             let dims: Vec<u64> = meta.shape.iter().rev().map(|&d| d as u64).collect();
 
             tensor_infos.push(GgufTensorInfo {
-                name: name.clone(),
+                name: item.gguf_name.clone(),
                 dimensions: dims,
                 ggml_type: target_type,
                 offset: running_data_offset,
@@ -67,10 +140,6 @@ impl StreamQuantizer {
 
         let mut metadata = HashMap::new();
         metadata.insert(
-            "general.architecture".to_string(),
-            GgufValue::String("llama".to_string()),
-        );
-        metadata.insert(
             "general.quantization_version".to_string(),
             GgufValue::Uint32(2),
         );
@@ -78,6 +147,43 @@ impl StreamQuantizer {
             "general.alignment".to_string(),
             GgufValue::Uint32(GGUF_DEFAULT_ALIGNMENT as u32),
         );
+
+        let parent_dir = p.parent().unwrap_or(Path::new("."));
+        let config_path = parent_dir.join("config.json");
+        let mut target_vocab_size = None;
+        let mut n_attn_heads = None;
+        let mut n_kv_heads = None;
+        let mut rope_is_neox = true;
+        if config_path.exists() {
+            let cfg = Self::load_config_json_metadata(&config_path);
+            metadata.extend(cfg.metadata);
+            target_vocab_size = cfg.vocab_size;
+            n_attn_heads = cfg.n_attn_heads;
+            n_kv_heads = cfg.n_kv_heads;
+            rope_is_neox = cfg.rope_is_neox;
+        }
+
+        let tokenizer_path = parent_dir.join("tokenizer.json");
+        if tokenizer_path.exists() {
+            let tok_cfg_path = parent_dir.join("tokenizer_config.json");
+            let tok_cfg = if tok_cfg_path.exists() {
+                Some(tok_cfg_path.as_path())
+            } else {
+                None
+            };
+            metadata.extend(Self::load_tokenizer_metadata(
+                &tokenizer_path,
+                tok_cfg,
+                target_vocab_size,
+            ));
+        }
+
+        if !metadata.contains_key("general.architecture") {
+            metadata.insert(
+                "general.architecture".to_string(),
+                GgufValue::String("llama".to_string()),
+            );
+        }
 
         let out_file = OpenOptions::new()
             .create(true)
@@ -90,13 +196,16 @@ impl StreamQuantizer {
 
         let mut quant_buffer = Vec::new();
 
-        for name in &tensor_names {
-            let meta = match header.tensors.get(name) {
+        for item in &emit_items {
+            let meta = match header.tensors.get(&item.source_name) {
                 Some(m) => m,
                 None => continue,
             };
 
-            let target_type = plan.get_type_for_tensor(name).unwrap_or(GgmlType::F16);
+            let target_type = plan
+                .get_type_for_tensor(&item.gguf_name)
+                .or_else(|| plan.get_type_for_tensor(&item.source_name))
+                .unwrap_or(GgmlType::F16);
 
             let src_start = data_start_offset.saturating_add(meta.data_offsets.0);
             let src_end = data_start_offset.saturating_add(meta.data_offsets.1);
@@ -108,8 +217,35 @@ impl StreamQuantizer {
                 });
             }
 
+            let permute_heads = if !rope_is_neox {
+                if item.source_name.ends_with("q_proj.weight")
+                    || item.source_name.ends_with("q_proj.bias")
+                    || item.gguf_name.ends_with("attn_q.weight")
+                    || item.gguf_name.ends_with("attn_q.bias")
+                {
+                    n_attn_heads
+                } else if item.source_name.ends_with("k_proj.weight")
+                    || item.source_name.ends_with("k_proj.bias")
+                    || item.gguf_name.ends_with("attn_k.weight")
+                    || item.gguf_name.ends_with("attn_k.bias")
+                {
+                    n_kv_heads
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let raw_src = &mmap[src_start..src_end];
-            quantize_raw_tensor(&meta.dtype, raw_src, target_type, &mut quant_buffer)?;
+            quantize_raw_tensor_with_permute(
+                &meta.dtype,
+                raw_src,
+                &meta.shape,
+                permute_heads,
+                target_type,
+                &mut quant_buffer,
+            )?;
 
             writer.write_tensor_data(&quant_buffer)?;
             quant_buffer.clear();
@@ -147,26 +283,49 @@ impl StreamQuantizer {
         };
 
         let multi = quant_core::load_multi_shard_headers(p)?;
-        let mut tensor_names: Vec<String> = multi.combined_tensors.keys().cloned().collect();
-        tensor_names.sort();
+        let mut sorted_sources: Vec<String> = multi.combined_tensors.keys().cloned().collect();
+        sorted_sources.sort();
 
-        let mut tensor_infos = Vec::with_capacity(tensor_names.len());
+        let mut emit_items = Vec::with_capacity(sorted_sources.len() + 1);
+        if !multi.combined_tensors.contains_key("lm_head.weight")
+            && multi
+                .combined_tensors
+                .contains_key("model.embed_tokens.weight")
+        {
+            emit_items.push(EmitTensorItem {
+                source_name: "model.embed_tokens.weight".to_string(),
+                gguf_name: "output.weight".to_string(),
+            });
+        }
+
+        for src in sorted_sources {
+            let gguf_name = map_hf_to_gguf_tensor_name(&src);
+            emit_items.push(EmitTensorItem {
+                source_name: src,
+                gguf_name,
+            });
+        }
+
+        let mut tensor_infos = Vec::with_capacity(emit_items.len());
         let mut running_data_offset = 0u64;
 
-        for name in &tensor_names {
-            let meta = match multi.combined_tensors.get(name) {
+        for item in &emit_items {
+            let meta = match multi.combined_tensors.get(&item.source_name) {
                 Some(m) => m,
                 None => continue,
             };
 
-            let target_type = plan.get_type_for_tensor(name).unwrap_or(GgmlType::F16);
+            let target_type = plan
+                .get_type_for_tensor(&item.gguf_name)
+                .or_else(|| plan.get_type_for_tensor(&item.source_name))
+                .unwrap_or(GgmlType::F16);
             let elem_count = meta.element_count();
             let size_bytes = target_type.bytes_for_elements(elem_count)? as u64;
 
             let dims: Vec<u64> = meta.shape.iter().rev().map(|&d| d as u64).collect();
 
             tensor_infos.push(GgufTensorInfo {
-                name: name.clone(),
+                name: item.gguf_name.clone(),
                 dimensions: dims,
                 ggml_type: target_type,
                 offset: running_data_offset,
@@ -181,10 +340,6 @@ impl StreamQuantizer {
 
         let mut metadata = HashMap::new();
         metadata.insert(
-            "general.architecture".to_string(),
-            GgufValue::String("llama".to_string()),
-        );
-        metadata.insert(
             "general.quantization_version".to_string(),
             GgufValue::Uint32(2),
         );
@@ -192,6 +347,43 @@ impl StreamQuantizer {
             "general.alignment".to_string(),
             GgufValue::Uint32(GGUF_DEFAULT_ALIGNMENT as u32),
         );
+
+        let parent_dir = p.parent().unwrap_or(Path::new("."));
+        let config_path = parent_dir.join("config.json");
+        let mut target_vocab_size = None;
+        let mut n_attn_heads = None;
+        let mut n_kv_heads = None;
+        let mut rope_is_neox = true;
+        if config_path.exists() {
+            let cfg = Self::load_config_json_metadata(&config_path);
+            metadata.extend(cfg.metadata);
+            target_vocab_size = cfg.vocab_size;
+            n_attn_heads = cfg.n_attn_heads;
+            n_kv_heads = cfg.n_kv_heads;
+            rope_is_neox = cfg.rope_is_neox;
+        }
+
+        let tokenizer_path = parent_dir.join("tokenizer.json");
+        if tokenizer_path.exists() {
+            let tok_cfg_path = parent_dir.join("tokenizer_config.json");
+            let tok_cfg = if tok_cfg_path.exists() {
+                Some(tok_cfg_path.as_path())
+            } else {
+                None
+            };
+            metadata.extend(Self::load_tokenizer_metadata(
+                &tokenizer_path,
+                tok_cfg,
+                target_vocab_size,
+            ));
+        }
+
+        if !metadata.contains_key("general.architecture") {
+            metadata.insert(
+                "general.architecture".to_string(),
+                GgufValue::String("llama".to_string()),
+            );
+        }
 
         let out_file = OpenOptions::new()
             .create(true)
@@ -205,12 +397,12 @@ impl StreamQuantizer {
         let mut quant_buffer = Vec::new();
         let mut current_shard: Option<(String, memmap2::Mmap, usize)> = None;
 
-        for name in &tensor_names {
-            let meta = match multi.combined_tensors.get(name) {
+        for item in &emit_items {
+            let meta = match multi.combined_tensors.get(&item.source_name) {
                 Some(m) => m,
                 None => continue,
             };
-            let shard_name = match multi.tensor_to_shard.get(name) {
+            let shard_name = match multi.tensor_to_shard.get(&item.source_name) {
                 Some(s) => s,
                 None => continue,
             };
@@ -237,7 +429,10 @@ impl StreamQuantizer {
                 None => continue,
             };
 
-            let target_type = plan.get_type_for_tensor(name).unwrap_or(GgmlType::F16);
+            let target_type = plan
+                .get_type_for_tensor(&item.gguf_name)
+                .or_else(|| plan.get_type_for_tensor(&item.source_name))
+                .unwrap_or(GgmlType::F16);
             let src_start = data_start_offset.saturating_add(meta.data_offsets.0);
             let src_end = data_start_offset.saturating_add(meta.data_offsets.1);
 
@@ -248,8 +443,35 @@ impl StreamQuantizer {
                 });
             }
 
+            let permute_heads = if !rope_is_neox {
+                if item.source_name.ends_with("q_proj.weight")
+                    || item.source_name.ends_with("q_proj.bias")
+                    || item.gguf_name.ends_with("attn_q.weight")
+                    || item.gguf_name.ends_with("attn_q.bias")
+                {
+                    n_attn_heads
+                } else if item.source_name.ends_with("k_proj.weight")
+                    || item.source_name.ends_with("k_proj.bias")
+                    || item.gguf_name.ends_with("attn_k.weight")
+                    || item.gguf_name.ends_with("attn_k.bias")
+                {
+                    n_kv_heads
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             let raw_src = &smmap[src_start..src_end];
-            quantize_raw_tensor(&meta.dtype, raw_src, target_type, &mut quant_buffer)?;
+            quantize_raw_tensor_with_permute(
+                &meta.dtype,
+                raw_src,
+                &meta.shape,
+                permute_heads,
+                target_type,
+                &mut quant_buffer,
+            )?;
 
             writer.write_tensor_data(&quant_buffer)?;
             quant_buffer.clear();
@@ -271,6 +493,282 @@ impl StreamQuantizer {
         }
 
         Ok(running_data_offset)
+    }
+
+    fn load_config_json_metadata(config_path: &Path) -> ConfigMeta {
+        let mut map = HashMap::new();
+        let content = match std::fs::read_to_string(config_path) {
+            Ok(c) => c,
+            Err(_) => return ConfigMeta::default(),
+        };
+
+        let val: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return ConfigMeta::default(),
+        };
+
+        let arch = match val.get("model_type").and_then(|v| v.as_str()) {
+            Some(t) => t.to_string(),
+            None => "llama".to_string(),
+        };
+
+        map.insert(
+            "general.architecture".to_string(),
+            GgufValue::String(arch.clone()),
+        );
+
+        if let Some(n) = val.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+            map.insert(format!("{arch}.block_count"), GgufValue::Uint32(n as u32));
+        }
+        if let Some(n) = val.get("max_position_embeddings").and_then(|v| v.as_u64()) {
+            map.insert(
+                format!("{arch}.context_length"),
+                GgufValue::Uint32(n as u32),
+            );
+        }
+        if let Some(n) = val.get("hidden_size").and_then(|v| v.as_u64()) {
+            map.insert(
+                format!("{arch}.embedding_length"),
+                GgufValue::Uint32(n as u32),
+            );
+        }
+        if let Some(n) = val.get("intermediate_size").and_then(|v| v.as_u64()) {
+            map.insert(
+                format!("{arch}.feed_forward_length"),
+                GgufValue::Uint32(n as u32),
+            );
+        }
+
+        let n_attn_heads = val
+            .get("num_attention_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        if let Some(n) = n_attn_heads {
+            map.insert(
+                format!("{arch}.attention.head_count"),
+                GgufValue::Uint32(n as u32),
+            );
+        }
+
+        let n_kv_heads = val
+            .get("num_key_value_heads")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+        if let Some(n) = n_kv_heads {
+            map.insert(
+                format!("{arch}.attention.head_count_kv"),
+                GgufValue::Uint32(n as u32),
+            );
+        }
+
+        if let (Some(h), Some(heads)) = (
+            val.get("hidden_size").and_then(|v| v.as_u64()),
+            val.get("num_attention_heads").and_then(|v| v.as_u64()),
+        ) {
+            if let Some(dim) = h.checked_div(heads) {
+                map.insert(
+                    format!("{arch}.rope.dimension_count"),
+                    GgufValue::Uint32(dim as u32),
+                );
+            }
+        }
+
+        if let Some(f) = val.get("rope_theta").and_then(|v| v.as_f64()) {
+            map.insert(
+                format!("{arch}.rope.freq_base"),
+                GgufValue::Float32(f as f32),
+            );
+        }
+        if let Some(f) = val.get("rms_norm_eps").and_then(|v| v.as_f64()) {
+            map.insert(
+                format!("{arch}.attention.layer_norm_rms_epsilon"),
+                GgufValue::Float32(f as f32),
+            );
+        }
+
+        let vocab_size = val
+            .get("vocab_size")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let rope_is_neox = val
+            .get("rope_is_neox_style")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        ConfigMeta {
+            metadata: map,
+            vocab_size,
+            n_attn_heads,
+            n_kv_heads,
+            rope_is_neox,
+        }
+    }
+
+    fn load_tokenizer_metadata(
+        tok_path: &Path,
+        tok_cfg_path: Option<&Path>,
+        target_vocab_size: Option<usize>,
+    ) -> HashMap<String, GgufValue> {
+        let mut map = HashMap::new();
+        let content = match std::fs::read_to_string(tok_path) {
+            Ok(c) => c,
+            Err(_) => return map,
+        };
+
+        let val: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return map,
+        };
+
+        let model_type = val
+            .get("model")
+            .and_then(|m| m.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("BPE");
+
+        let (ggml_model, ggml_pre) = if model_type.eq_ignore_ascii_case("bpe") {
+            ("gpt2", "qwen2")
+        } else {
+            ("llama", "default")
+        };
+
+        map.insert(
+            "tokenizer.ggml.model".to_string(),
+            GgufValue::String(ggml_model.to_string()),
+        );
+        map.insert(
+            "tokenizer.ggml.pre".to_string(),
+            GgufValue::String(ggml_pre.to_string()),
+        );
+
+        let mut max_id: usize = 0;
+        let mut token_map: HashMap<usize, (String, bool)> = HashMap::new();
+
+        if let Some(vocab_obj) = val
+            .get("model")
+            .and_then(|m| m.get("vocab"))
+            .and_then(|v| v.as_object())
+        {
+            for (tok, id_val) in vocab_obj {
+                if let Some(id) = id_val.as_u64().map(|x| x as usize) {
+                    if id > max_id {
+                        max_id = id;
+                    }
+                    token_map.insert(id, (tok.clone(), false));
+                }
+            }
+        }
+
+        if let Some(added_arr) = val.get("added_tokens").and_then(|a| a.as_array()) {
+            for item in added_arr {
+                let id = item.get("id").and_then(|i| i.as_u64()).map(|x| x as usize);
+                let content = item.get("content").and_then(|c| c.as_str());
+                let special = item
+                    .get("special")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false);
+                if let (Some(id), Some(content)) = (id, content) {
+                    if id > max_id {
+                        max_id = id;
+                    }
+                    token_map.insert(id, (content.to_string(), special));
+                }
+            }
+        }
+
+        if !token_map.is_empty() {
+            let total = match target_vocab_size {
+                Some(v) => (max_id + 1).max(v),
+                None => max_id + 1,
+            };
+
+            let mut tokens = Vec::with_capacity(total);
+            let mut token_types = Vec::with_capacity(total);
+
+            for id in 0..total {
+                if let Some((tok_str, is_special)) = token_map.get(&id) {
+                    tokens.push(GgufValue::String(tok_str.clone()));
+                    let t_type = if *is_special { 3i32 } else { 1i32 };
+                    token_types.push(GgufValue::Int32(t_type));
+                } else {
+                    tokens.push(GgufValue::String(format!("[PAD{id}]")));
+                    token_types.push(GgufValue::Int32(5i32));
+                }
+            }
+
+            map.insert(
+                "tokenizer.ggml.tokens".to_string(),
+                GgufValue::Array(tokens),
+            );
+            map.insert(
+                "tokenizer.ggml.token_type".to_string(),
+                GgufValue::Array(token_types),
+            );
+        }
+
+        if let Some(merges_arr) = val
+            .get("model")
+            .and_then(|m| m.get("merges"))
+            .and_then(|m| m.as_array())
+        {
+            let mut merges = Vec::with_capacity(merges_arr.len());
+            for item in merges_arr {
+                if let Some(s) = item.as_str() {
+                    merges.push(GgufValue::String(s.to_string()));
+                }
+            }
+            if !merges.is_empty() {
+                map.insert(
+                    "tokenizer.ggml.merges".to_string(),
+                    GgufValue::Array(merges),
+                );
+            }
+        }
+
+        map.insert(
+            "tokenizer.ggml.add_bos_token".to_string(),
+            GgufValue::Bool(false),
+        );
+
+        if let Some(cfg_path) = tok_cfg_path {
+            if let Ok(cfg_content) = std::fs::read_to_string(cfg_path) {
+                if let Ok(cfg_val) = serde_json::from_str::<serde_json::Value>(&cfg_content) {
+                    if let Some(chat_tmpl) = cfg_val.get("chat_template").and_then(|t| t.as_str()) {
+                        map.insert(
+                            "tokenizer.chat_template".to_string(),
+                            GgufValue::String(chat_tmpl.to_string()),
+                        );
+                    }
+                    if let Some(add_bos) = cfg_val.get("add_bos_token").and_then(|b| b.as_bool()) {
+                        map.insert(
+                            "tokenizer.ggml.add_bos_token".to_string(),
+                            GgufValue::Bool(add_bos),
+                        );
+                    }
+                }
+            }
+        }
+
+        for (id, (tok_str, _)) in &token_map {
+            if tok_str == "<|im_end|>" {
+                map.insert(
+                    "tokenizer.ggml.eos_token_id".to_string(),
+                    GgufValue::Uint32(*id as u32),
+                );
+            } else if tok_str == "<|endoftext|>" {
+                map.insert(
+                    "tokenizer.ggml.padding_token_id".to_string(),
+                    GgufValue::Uint32(*id as u32),
+                );
+                map.insert(
+                    "tokenizer.ggml.bos_token_id".to_string(),
+                    GgufValue::Uint32(*id as u32),
+                );
+            }
+        }
+
+        map
     }
 }
 
@@ -321,10 +819,7 @@ mod tests {
         let gguf_hdr = crate::reader::inspect_gguf_file(out_temp.path()).unwrap();
         assert_eq!(gguf_hdr.version, 3);
         assert_eq!(gguf_hdr.tensor_count, 1);
-        assert_eq!(
-            gguf_hdr.tensors[0].name,
-            "model.layers.0.self_attn.q_proj.weight"
-        );
+        assert_eq!(gguf_hdr.tensors[0].name, "blk.0.attn_q.weight");
     }
 
     #[test]

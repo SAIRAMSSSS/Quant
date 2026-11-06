@@ -123,33 +123,73 @@ fn parse_size_to_bytes(s: &str) -> Result<u64> {
 }
 
 fn extract_model_tensors_map(header: &SafetensorsHeader) -> HashMap<String, (Vec<usize>, usize)> {
-    let mut map = HashMap::with_capacity(header.tensors.len());
+    let mut map = HashMap::with_capacity(header.tensors.len() + 1);
     for (k, v) in &header.tensors {
         map.insert(k.clone(), (v.shape.clone(), v.element_count()));
+    }
+    if !map.contains_key("lm_head.weight") {
+        if let Some((shape, count)) = map.get("model.embed_tokens.weight").cloned() {
+            map.insert("lm_head.weight".to_string(), (shape, count));
+        }
     }
     map
 }
 
-fn estimate_kv_cache(header: &SafetensorsHeader, ctx_len: usize, kv_type: GgmlType) -> usize {
+fn estimate_kv_cache(
+    header: &SafetensorsHeader,
+    target: &str,
+    ctx_len: usize,
+    kv_type: GgmlType,
+) -> usize {
     let mut n_layers = 0usize;
-    let n_kv_heads = 8usize;
+    let mut n_kv_heads = 8usize;
     let mut head_dim = 128usize;
 
-    for (name, meta) in &header.tensors {
-        if name.contains("layers.") {
-            let parts: Vec<&str> = name.split('.').collect();
-            for (idx, &part) in parts.iter().enumerate() {
-                if part == "layers" && idx + 1 < parts.len() {
-                    if let Ok(num) = parts[idx + 1].parse::<usize>() {
-                        if num + 1 > n_layers {
-                            n_layers = num + 1;
-                        }
+    let p = Path::new(target);
+    let config_path = if p.is_dir() {
+        p.join("config.json")
+    } else {
+        p.parent().unwrap_or(Path::new(".")).join("config.json")
+    };
+
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(l) = val.get("num_hidden_layers").and_then(|v| v.as_u64()) {
+                    n_layers = l as usize;
+                }
+                if let Some(kv) = val.get("num_key_value_heads").and_then(|v| v.as_u64()) {
+                    n_kv_heads = kv as usize;
+                }
+                if let (Some(h), Some(heads)) = (
+                    val.get("hidden_size").and_then(|v| v.as_u64()),
+                    val.get("num_attention_heads").and_then(|v| v.as_u64()),
+                ) {
+                    if let Some(d) = h.checked_div(heads) {
+                        head_dim = d as usize;
                     }
                 }
             }
         }
-        if name.contains("k_proj") && meta.shape.len() >= 2 {
-            head_dim = meta.shape[1].min(128);
+    }
+
+    if n_layers == 0 {
+        for (name, meta) in &header.tensors {
+            if name.contains("layers.") {
+                let parts: Vec<&str> = name.split('.').collect();
+                for (idx, &part) in parts.iter().enumerate() {
+                    if part == "layers" && idx + 1 < parts.len() {
+                        if let Ok(num) = parts[idx + 1].parse::<usize>() {
+                            if num + 1 > n_layers {
+                                n_layers = num + 1;
+                            }
+                        }
+                    }
+                }
+            }
+            if name.contains("k_proj") && meta.shape.len() >= 2 {
+                head_dim = meta.shape[1].min(128);
+            }
         }
     }
 
@@ -358,7 +398,7 @@ fn main() -> Result<()> {
             );
             let header = load_safetensors_header(&model)?;
             let tensor_map = extract_model_tensors_map(&header);
-            let kv_bytes = estimate_kv_cache(&header, ctx_size, kv_enum);
+            let kv_bytes = estimate_kv_cache(&header, &model, ctx_size, kv_enum);
 
             let groups = MckpSolver::build_tensor_groups(&tensor_map)?;
             let plan = MckpSolver::solve(&groups, target_bytes as usize, kv_bytes, overhead_bytes)?;
@@ -385,7 +425,7 @@ fn main() -> Result<()> {
             println!("Generating quantization plan for: {}", model.display());
             let header = load_safetensors_header(&model.to_string_lossy())?;
             let tensor_map = extract_model_tensors_map(&header);
-            let kv_bytes = estimate_kv_cache(&header, ctx_size, kv_enum);
+            let kv_bytes = estimate_kv_cache(&header, &model.to_string_lossy(), ctx_size, kv_enum);
 
             let groups = MckpSolver::build_tensor_groups(&tensor_map)?;
             let plan = MckpSolver::solve(&groups, target_bytes as usize, kv_bytes, overhead_bytes)?;

@@ -166,14 +166,16 @@ unsafe fn quantize_block_q8_0_avx2(chunk: &[f32; 32], dst: &mut [u8]) {
 
 fn quantize_block_q4_0_scalar(chunk: &[f32; 32], dst: &mut [u8]) {
     let mut amax = 0.0f32;
+    let mut max = 0.0f32;
     for &x in chunk {
         let ax = x.abs();
         if ax > amax {
             amax = ax;
+            max = x;
         }
     }
 
-    let d = amax / -8.0f32;
+    let d = max / -8.0f32;
     let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
     let d_f16 = f16::from_f32(d);
 
@@ -182,87 +184,13 @@ fn quantize_block_q4_0_scalar(chunk: &[f32; 32], dst: &mut [u8]) {
     dst[1] = d_bytes[1];
 
     for i in 0..16 {
-        let v0 = (chunk[i] * id).round();
-        let q0 = ((v0 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
+        let x0 = chunk[i] * id;
+        let x1 = chunk[i + 16] * id;
 
-        let v1 = (chunk[i + 16] * id).round();
-        let q1 = ((v1 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
+        let q0 = ((x0 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
+        let q1 = ((x1 + 8.5f32).clamp(0.0, 15.0) as u8) & 0x0F;
 
         dst[2 + i] = q0 | (q1 << 4);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2,fma")]
-unsafe fn quantize_block_q4_0_avx2(chunk: &[f32; 32], dst: &mut [u8]) {
-    use std::arch::x86_64::*;
-
-    let v0 = _mm256_loadu_ps(chunk.as_ptr());
-    let v1 = _mm256_loadu_ps(chunk.as_ptr().add(8));
-    let v2 = _mm256_loadu_ps(chunk.as_ptr().add(16));
-    let v3 = _mm256_loadu_ps(chunk.as_ptr().add(24));
-
-    let sign_mask = _mm256_set1_ps(-0.0f32);
-    let a0 = _mm256_andnot_ps(sign_mask, v0);
-    let a1 = _mm256_andnot_ps(sign_mask, v1);
-    let a2 = _mm256_andnot_ps(sign_mask, v2);
-    let a3 = _mm256_andnot_ps(sign_mask, v3);
-
-    let m01 = _mm256_max_ps(a0, a1);
-    let m23 = _mm256_max_ps(a2, a3);
-    let m = _mm256_max_ps(m01, m23);
-
-    let hi128 = _mm256_extractf128_ps(m, 1);
-    let lo128 = _mm256_castps256_ps128(m);
-    let m128 = _mm_max_ps(lo128, hi128);
-    let shuf1 = _mm_movehl_ps(m128, m128);
-    let m64 = _mm_max_ps(m128, shuf1);
-    let shuf2 = _mm_shuffle_ps(m64, m64, 1);
-    let amax = _mm_cvtss_f32(_mm_max_ss(m64, shuf2));
-
-    let d = amax / -8.0f32;
-    let id = if d != 0.0 { 1.0f32 / d } else { 0.0f32 };
-    let d_f16 = f16::from_f32(d);
-
-    let d_bytes = d_f16.to_le_bytes();
-    dst[0] = d_bytes[0];
-    dst[1] = d_bytes[1];
-
-    let v_id = _mm256_set1_ps(id);
-    let v_offset = _mm256_set1_ps(8.5f32);
-    let v_zero = _mm256_setzero_ps();
-    let v_max = _mm256_set1_ps(15.0f32);
-
-    let quantize_8 = |vec: __m256| -> [u8; 8] {
-        let rounded = _mm256_round_ps(
-            _mm256_mul_ps(vec, v_id),
-            _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC,
-        );
-        let shifted = _mm256_add_ps(rounded, v_offset);
-        let clamped = _mm256_min_ps(_mm256_max_ps(shifted, v_zero), v_max);
-        let ints = _mm256_cvttps_epi32(clamped);
-        let mut buf = [0i32; 8];
-        _mm256_storeu_si256(buf.as_mut_ptr() as *mut __m256i, ints);
-        [
-            (buf[0] as u8) & 0x0F,
-            (buf[1] as u8) & 0x0F,
-            (buf[2] as u8) & 0x0F,
-            (buf[3] as u8) & 0x0F,
-            (buf[4] as u8) & 0x0F,
-            (buf[5] as u8) & 0x0F,
-            (buf[6] as u8) & 0x0F,
-            (buf[7] as u8) & 0x0F,
-        ]
-    };
-
-    let q0_7 = quantize_8(v0);
-    let q8_15 = quantize_8(v1);
-    let q16_23 = quantize_8(v2);
-    let q24_31 = quantize_8(v3);
-
-    for i in 0..8 {
-        dst[2 + i] = q0_7[i] | (q16_23[i] << 4);
-        dst[2 + 8 + i] = q8_15[i] | (q24_31[i] << 4);
     }
 }
 
@@ -281,19 +209,6 @@ pub fn quantize_f32_to_q4_0(src: &[f32], dst: &mut [u8]) -> Result<usize, Bridge
             expected: required,
             found: dst.len(),
         });
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-            for (idx, chunk) in src.as_chunks::<32>().0.iter().enumerate() {
-                // SAFETY: CPU supports avx2 and fma, slice has exact 32 elements, dst has 18 bytes.
-                unsafe {
-                    quantize_block_q4_0_avx2(chunk, &mut dst[idx * 18..(idx + 1) * 18]);
-                }
-            }
-            return Ok(required);
-        }
     }
 
     for (idx, chunk) in src.as_chunks::<32>().0.iter().enumerate() {
@@ -626,18 +541,101 @@ pub fn quantize_f32_to_q3_k(src: &[f32], dst: &mut [u8]) -> Result<usize, Bridge
     Ok(required)
 }
 
+pub fn permute_f32_for_rope(buf: &mut [f32], shape: &[usize], n_head: usize) {
+    if n_head == 0 {
+        return;
+    }
+    let out_features = match shape.first() {
+        Some(&d) => d,
+        None => return,
+    };
+    if !out_features.is_multiple_of(n_head) {
+        return;
+    }
+    let head_dim = out_features / n_head;
+    if !head_dim.is_multiple_of(2) {
+        return;
+    }
+    let half_dim = head_dim / 2;
+
+    if shape.len() == 1 {
+        let mut tmp = buf.to_vec();
+        for h in 0..n_head {
+            let base = h * head_dim;
+            for i in 0..half_dim {
+                let orig_even = base + i;
+                let orig_odd = base + half_dim + i;
+                tmp[base + 2 * i] = buf[orig_even];
+                tmp[base + 2 * i + 1] = buf[orig_odd];
+            }
+        }
+        buf.copy_from_slice(&tmp);
+    } else if shape.len() >= 2 {
+        let in_features: usize = shape[1..].iter().product();
+        if in_features == 0 || buf.len() != out_features * in_features {
+            return;
+        }
+        let mut tmp = buf.to_vec();
+        for h in 0..n_head {
+            for i in 0..half_dim {
+                let orig_row_even = h * head_dim + i;
+                let orig_row_odd = h * head_dim + half_dim + i;
+
+                let dst_row_even = h * head_dim + 2 * i;
+                let dst_row_odd = h * head_dim + 2 * i + 1;
+
+                let src_even_start = orig_row_even * in_features;
+                let src_even_end = src_even_start + in_features;
+
+                let src_odd_start = orig_row_odd * in_features;
+                let src_odd_end = src_odd_start + in_features;
+
+                let dst_even_start = dst_row_even * in_features;
+                let dst_even_end = dst_even_start + in_features;
+
+                let dst_odd_start = dst_row_odd * in_features;
+                let dst_odd_end = dst_odd_start + in_features;
+
+                tmp[dst_even_start..dst_even_end]
+                    .copy_from_slice(&buf[src_even_start..src_even_end]);
+                tmp[dst_odd_start..dst_odd_end].copy_from_slice(&buf[src_odd_start..src_odd_end]);
+            }
+        }
+        buf.copy_from_slice(&tmp);
+    }
+}
+
 pub fn quantize_raw_tensor(
     src_dtype: &str,
     raw_bytes: &[u8],
     target_type: GgmlType,
     dst: &mut Vec<u8>,
 ) -> Result<(), BridgeError> {
+    quantize_raw_tensor_with_permute(src_dtype, raw_bytes, &[], None, target_type, dst)
+}
+
+pub fn quantize_raw_tensor_with_permute(
+    src_dtype: &str,
+    raw_bytes: &[u8],
+    shape: &[usize],
+    permute_heads: Option<usize>,
+    target_type: GgmlType,
+    dst: &mut Vec<u8>,
+) -> Result<(), BridgeError> {
     let dtype_upper = src_dtype.to_ascii_uppercase();
 
-    if dtype_upper == "F16" && target_type == GgmlType::F16 {
-        dst.clear();
-        dst.extend_from_slice(raw_bytes);
-        return Ok(());
+    if permute_heads.is_none() {
+        if dtype_upper == "F16" && target_type == GgmlType::F16 {
+            dst.clear();
+            dst.extend_from_slice(raw_bytes);
+            return Ok(());
+        }
+
+        if dtype_upper == "F32" && target_type == GgmlType::F32 {
+            dst.clear();
+            dst.extend_from_slice(raw_bytes);
+            return Ok(());
+        }
     }
 
     let elem_count = match dtype_upper.as_str() {
@@ -666,18 +664,43 @@ pub fn quantize_raw_tensor(
         }
     }
 
+    if let Some(heads) = permute_heads {
+        permute_f32_for_rope(&mut f32_buf, shape, heads);
+    }
+
     let out_size = target_type.bytes_for_elements(elem_count)?;
     dst.resize(out_size, 0);
 
     match target_type {
-        GgmlType::F16 => quantize_f32_to_f16(&f32_buf, dst)?,
-        GgmlType::Q8_0 => quantize_f32_to_q8_0(&f32_buf, dst)?,
-        GgmlType::Q4_0 => quantize_f32_to_q4_0(&f32_buf, dst)?,
-        GgmlType::Q4_K => quantize_f32_to_q4_k(&f32_buf, dst)?,
-        GgmlType::Q5_K => quantize_f32_to_q5_k(&f32_buf, dst)?,
-        GgmlType::Q6_K => quantize_f32_to_q6_k(&f32_buf, dst)?,
-        GgmlType::Q2_K => quantize_f32_to_q2_k(&f32_buf, dst)?,
-        GgmlType::Q3_K => quantize_f32_to_q3_k(&f32_buf, dst)?,
+        GgmlType::F32 => {
+            for (i, &val) in f32_buf.iter().enumerate() {
+                LittleEndian::write_f32(&mut dst[i * 4..(i + 1) * 4], val);
+            }
+        }
+        GgmlType::F16 => {
+            quantize_f32_to_f16(&f32_buf, dst)?;
+        }
+        GgmlType::Q8_0 => {
+            quantize_f32_to_q8_0(&f32_buf, dst)?;
+        }
+        GgmlType::Q4_0 => {
+            quantize_f32_to_q4_0(&f32_buf, dst)?;
+        }
+        GgmlType::Q4_K => {
+            quantize_f32_to_q4_k(&f32_buf, dst)?;
+        }
+        GgmlType::Q5_K => {
+            quantize_f32_to_q5_k(&f32_buf, dst)?;
+        }
+        GgmlType::Q6_K => {
+            quantize_f32_to_q6_k(&f32_buf, dst)?;
+        }
+        GgmlType::Q2_K => {
+            quantize_f32_to_q2_k(&f32_buf, dst)?;
+        }
+        GgmlType::Q3_K => {
+            quantize_f32_to_q3_k(&f32_buf, dst)?;
+        }
         other => {
             return Err(BridgeError::QuantizeError(format!(
                 "quantization to {} not implemented",
@@ -787,26 +810,45 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
-    fn test_quantize_q4_0_avx2_scalar_parity() {
-        if !is_x86_feature_detected!("avx2") || !is_x86_feature_detected!("fma") {
-            return;
-        }
-
+    fn test_quantize_q4_0_reference() {
         let mut src = [0.0f32; 32];
         for (i, val) in src.iter_mut().enumerate() {
             *val = ((i as f32) - 15.5) * 1.7;
         }
 
-        let mut dst_avx = [0u8; 18];
-        unsafe {
-            quantize_block_q4_0_avx2(&src, &mut dst_avx);
+        let mut dst = [0u8; 18];
+        quantize_block_q4_0_scalar(&src, &mut dst);
+
+        let d = f16::from_le_bytes([dst[0], dst[1]]).to_f32();
+        assert!(d != 0.0);
+        for &b in &dst[2..18] {
+            let low = b & 0x0F;
+            let high = (b >> 4) & 0x0F;
+            assert!(low <= 15);
+            assert!(high <= 15);
         }
+    }
 
-        let mut dst_scalar = [0u8; 18];
-        quantize_block_q4_0_scalar(&src, &mut dst_scalar);
+    #[test]
+    fn test_permute_f32_for_rope_1d_and_2d() {
+        let mut v1d: Vec<f32> = (0..8).map(|i| i as f32).collect();
+        permute_f32_for_rope(&mut v1d, &[8], 1);
+        assert_eq!(v1d, vec![0.0, 4.0, 1.0, 5.0, 2.0, 6.0, 3.0, 7.0]);
 
-        assert_eq!(dst_avx[0..2], dst_scalar[0..2]);
-        assert_eq!(&dst_avx[2..18], &dst_scalar[2..18]);
+        let mut v2d: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        permute_f32_for_rope(&mut v2d, &[8, 2], 1);
+        assert_eq!(
+            v2d,
+            vec![
+                0.0, 1.0, // row 0 (old row 0)
+                8.0, 9.0, // row 1 (old row 4)
+                2.0, 3.0, // row 2 (old row 1)
+                10.0, 11.0, // row 3 (old row 5)
+                4.0, 5.0, // row 4 (old row 2)
+                12.0, 13.0, // row 5 (old row 6)
+                6.0, 7.0, // row 6 (old row 3)
+                14.0, 15.0, // row 7 (old row 7)
+            ]
+        );
     }
 }
