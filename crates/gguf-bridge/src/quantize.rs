@@ -668,38 +668,46 @@ pub fn quantize_raw_tensor_with_permute(
         permute_f32_for_rope(&mut f32_buf, shape, heads);
     }
 
-    let out_size = target_type.bytes_for_elements(elem_count)?;
+    quantize_f32_slice(&f32_buf, target_type, dst)
+}
+
+pub fn quantize_f32_slice(
+    f32_slice: &[f32],
+    target_type: GgmlType,
+    dst: &mut Vec<u8>,
+) -> Result<(), BridgeError> {
+    let out_size = target_type.bytes_for_elements(f32_slice.len())?;
     dst.resize(out_size, 0);
 
     match target_type {
         GgmlType::F32 => {
-            for (i, &val) in f32_buf.iter().enumerate() {
+            for (i, &val) in f32_slice.iter().enumerate() {
                 LittleEndian::write_f32(&mut dst[i * 4..(i + 1) * 4], val);
             }
         }
         GgmlType::F16 => {
-            quantize_f32_to_f16(&f32_buf, dst)?;
+            quantize_f32_to_f16(f32_slice, dst)?;
         }
         GgmlType::Q8_0 => {
-            quantize_f32_to_q8_0(&f32_buf, dst)?;
+            quantize_f32_to_q8_0(f32_slice, dst)?;
         }
         GgmlType::Q4_0 => {
-            quantize_f32_to_q4_0(&f32_buf, dst)?;
+            quantize_f32_to_q4_0(f32_slice, dst)?;
         }
         GgmlType::Q4_K => {
-            quantize_f32_to_q4_k(&f32_buf, dst)?;
+            quantize_f32_to_q4_k(f32_slice, dst)?;
         }
         GgmlType::Q5_K => {
-            quantize_f32_to_q5_k(&f32_buf, dst)?;
+            quantize_f32_to_q5_k(f32_slice, dst)?;
         }
         GgmlType::Q6_K => {
-            quantize_f32_to_q6_k(&f32_buf, dst)?;
+            quantize_f32_to_q6_k(f32_slice, dst)?;
         }
         GgmlType::Q2_K => {
-            quantize_f32_to_q2_k(&f32_buf, dst)?;
+            quantize_f32_to_q2_k(f32_slice, dst)?;
         }
         GgmlType::Q3_K => {
-            quantize_f32_to_q3_k(&f32_buf, dst)?;
+            quantize_f32_to_q3_k(f32_slice, dst)?;
         }
         other => {
             return Err(BridgeError::QuantizeError(format!(

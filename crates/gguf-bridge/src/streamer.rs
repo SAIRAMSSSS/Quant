@@ -1,15 +1,18 @@
 use crate::constants::GGUF_DEFAULT_ALIGNMENT;
 use crate::error::BridgeError;
 use crate::metadata::GgufValue;
-use crate::quantize::quantize_raw_tensor_with_permute;
+use crate::quantize::{quantize_f32_slice, quantize_raw_tensor_with_permute};
 use crate::tensor_info::GgufTensorInfo;
 use crate::writer::GgufWriter;
+use byteorder::{ByteOrder, LittleEndian};
+use half::f16;
 use quant_core::mckp::QuantizationPlan;
 use quant_core::page_aligned::align_to_page;
 use quant_core::safetensors::parse_header_bytes;
 use quant_core::types::GgmlType;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
+use std::io::BufWriter;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -191,9 +194,11 @@ impl StreamQuantizer {
             .truncate(true)
             .open(output_path)?;
 
-        let mut writer = GgufWriter::new(out_file, GGUF_DEFAULT_ALIGNMENT);
+        let buf_writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
+        let mut writer = GgufWriter::new(buf_writer, GGUF_DEFAULT_ALIGNMENT);
         writer.write_header_and_metadata(&metadata, &tensor_infos)?;
 
+        let mut f32_buffer = Vec::new();
         let mut quant_buffer = Vec::new();
 
         for item in &emit_items {
@@ -238,17 +243,16 @@ impl StreamQuantizer {
             };
 
             let raw_src = &mmap[src_start..src_end];
-            quantize_raw_tensor_with_permute(
+            stream_write_tensor(
+                &mut writer,
                 &meta.dtype,
                 raw_src,
                 &meta.shape,
                 permute_heads,
                 target_type,
+                &mut f32_buffer,
                 &mut quant_buffer,
             )?;
-
-            writer.write_tensor_data(&quant_buffer)?;
-            quant_buffer.clear();
 
             #[cfg(unix)]
             {
@@ -391,9 +395,11 @@ impl StreamQuantizer {
             .truncate(true)
             .open(output_path)?;
 
-        let mut writer = GgufWriter::new(out_file, GGUF_DEFAULT_ALIGNMENT);
+        let buf_writer = BufWriter::with_capacity(4 * 1024 * 1024, out_file);
+        let mut writer = GgufWriter::new(buf_writer, GGUF_DEFAULT_ALIGNMENT);
         writer.write_header_and_metadata(&metadata, &tensor_infos)?;
 
+        let mut f32_buffer = Vec::new();
         let mut quant_buffer = Vec::new();
         let mut current_shard: Option<(String, memmap2::Mmap, usize)> = None;
 
@@ -464,17 +470,16 @@ impl StreamQuantizer {
             };
 
             let raw_src = &smmap[src_start..src_end];
-            quantize_raw_tensor_with_permute(
+            stream_write_tensor(
+                &mut writer,
                 &meta.dtype,
                 raw_src,
                 &meta.shape,
                 permute_heads,
                 target_type,
+                &mut f32_buffer,
                 &mut quant_buffer,
             )?;
-
-            writer.write_tensor_data(&quant_buffer)?;
-            quant_buffer.clear();
 
             #[cfg(unix)]
             {
@@ -770,6 +775,95 @@ impl StreamQuantizer {
 
         map
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn stream_write_tensor<W: std::io::Write + std::io::Seek>(
+    writer: &mut GgufWriter<W>,
+    src_dtype: &str,
+    raw_src: &[u8],
+    shape: &[usize],
+    permute_heads: Option<usize>,
+    target_type: GgmlType,
+    f32_buf: &mut Vec<f32>,
+    quant_buf: &mut Vec<u8>,
+) -> Result<(), BridgeError> {
+    let dtype_upper = src_dtype.to_ascii_uppercase();
+
+    if permute_heads.is_some() {
+        quantize_raw_tensor_with_permute(
+            src_dtype,
+            raw_src,
+            shape,
+            permute_heads,
+            target_type,
+            quant_buf,
+        )?;
+        writer.write_tensor_data(quant_buf)?;
+        quant_buf.clear();
+        quant_buf.shrink_to(64 * 1024);
+        return Ok(());
+    }
+
+    let elem_count = match dtype_upper.as_str() {
+        "F16" | "BF16" => raw_src.len() / 2,
+        "F32" => raw_src.len() / 4,
+        other => return Err(BridgeError::UnsupportedSourceDtype(other.to_string())),
+    };
+
+    let src_elem_bytes = match dtype_upper.as_str() {
+        "F16" | "BF16" => 2,
+        "F32" => 4,
+        _ => 4,
+    };
+
+    if (dtype_upper == "F16" && target_type == GgmlType::F16)
+        || (dtype_upper == "F32" && target_type == GgmlType::F32)
+    {
+        writer.write_tensor_data(raw_src)?;
+        return Ok(());
+    }
+
+    const CHUNK_ELEMS: usize = 65536;
+    let mut offset_elems = 0;
+
+    while offset_elems < elem_count {
+        let n = (elem_count - offset_elems).min(CHUNK_ELEMS);
+        let src_start = offset_elems * src_elem_bytes;
+        let src_end = src_start + n * src_elem_bytes;
+        let raw_chunk = &raw_src[src_start..src_end];
+
+        f32_buf.resize(n, 0.0);
+        match dtype_upper.as_str() {
+            "F16" => {
+                for (i, c) in raw_chunk.as_chunks::<2>().0.iter().enumerate() {
+                    f32_buf[i] = f16::from_le_bytes([c[0], c[1]]).to_f32();
+                }
+            }
+            "BF16" => {
+                for (i, c) in raw_chunk.as_chunks::<2>().0.iter().enumerate() {
+                    let u = LittleEndian::read_u16(c);
+                    f32_buf[i] = f32::from_bits((u as u32) << 16);
+                }
+            }
+            _ => {
+                for (i, c) in raw_chunk.as_chunks::<4>().0.iter().enumerate() {
+                    f32_buf[i] = LittleEndian::read_f32(c);
+                }
+            }
+        }
+
+        quantize_f32_slice(f32_buf, target_type, quant_buf)?;
+        writer.write_tensor_data_chunk(quant_buf)?;
+        offset_elems += n;
+    }
+
+    writer.finish_tensor_data()?;
+    quant_buf.clear();
+    quant_buf.shrink_to(64 * 1024);
+    f32_buf.clear();
+    f32_buf.shrink_to(64 * 1024);
+    Ok(())
 }
 
 #[cfg(test)]

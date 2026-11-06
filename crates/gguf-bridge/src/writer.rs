@@ -82,4 +82,24 @@ impl<W: Write + Seek> GgufWriter<W> {
         self.writer.flush()?;
         Ok(offset)
     }
+
+    pub fn write_tensor_data_chunk(&mut self, chunk: &[u8]) -> Result<(), BridgeError> {
+        self.writer.write_all(chunk)?;
+        self.current_data_offset += chunk.len() as u64;
+        Ok(())
+    }
+
+    pub fn finish_tensor_data(&mut self) -> Result<u64, BridgeError> {
+        let offset = self.current_data_offset;
+        let rem = (self.current_data_offset as usize) % self.alignment;
+        if rem != 0 {
+            let pad = self.alignment - rem;
+            let zeros = vec![0u8; pad];
+            self.writer.write_all(&zeros)?;
+            self.current_data_offset += pad as u64;
+        }
+
+        self.writer.flush()?;
+        Ok(offset)
+    }
 }
