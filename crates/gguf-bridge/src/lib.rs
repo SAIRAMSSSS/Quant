@@ -13,9 +13,10 @@ pub use error::BridgeError;
 pub use llama_cli::LlamaQuantizeRunner;
 pub use metadata::GgufValue;
 pub use quantize::{
-    permute_f32_for_rope, quantize_f32_to_f16, quantize_f32_to_q2_k, quantize_f32_to_q3_k,
-    quantize_f32_to_q4_0, quantize_f32_to_q4_k, quantize_f32_to_q5_k, quantize_f32_to_q6_k,
-    quantize_f32_to_q8_0, quantize_raw_tensor, quantize_raw_tensor_with_permute,
+    permute_f32_for_rope, quantize_f32_slice, quantize_f32_to_f16, quantize_f32_to_q2_k,
+    quantize_f32_to_q3_k, quantize_f32_to_q4_0, quantize_f32_to_q4_k, quantize_f32_to_q5_k,
+    quantize_f32_to_q6_k, quantize_f32_to_q8_0, quantize_raw_tensor,
+    quantize_raw_tensor_with_permute,
 };
 pub use reader::{inspect_gguf_file, read_gguf_header, GgufHeader};
 pub use streamer::StreamQuantizer;

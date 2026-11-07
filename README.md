@@ -59,14 +59,53 @@ crates/
 
 Measured on host hardware: AMD Ryzen 5, 24 GiB RAM, NVIDIA GeForce RTX 3050 Laptop GPU (4.0 GiB VRAM), Linux 6.12.
 
+### 1. End-to-End Streaming & Memory Limits
+
 | Metric | Measured Result | Constraint / Baseline |
 | :--- | :--- | :--- |
-| **Streaming Peak RSS** | **313.62 MiB** | `< 500 MB` RSS Cap |
+| **Streaming Peak RSS** | **72.47 MiB** (synthetic) / **313.62 MiB** (real model) | `< 500 MB` RSS Cap |
 | **Quantization Duration (0.5B, 291 layers)** | **6.627 seconds** | 3.3x speedup over non-chunked baseline |
+| **Streaming Throughput** | **434.83 MiB/s (0.425 GiB/s)** | Sequential NVMe/RAM stream |
 | **Remote Header Inspection Latency** | **1.82 seconds** | Zero-weight load over HTTP |
 | **Remote Planning RAM** | **11.4 MiB** | `< 50 MB` RAM Cap |
 | **Inference Generation (Qwen2.5-Coder-0.5B Mixed)** | **59.61 tokens/sec** | Native `llama-server` on RTX 3050 |
 | **Workspace Unit Tests** | **39/39 passing** | 100% test pass rate across 5 crates |
+
+### 2. SIMD Kernel Micro-Benchmarks (`cargo bench -p quant-gguf-bridge`)
+
+Evaluated on 1,048,576 FP32 elements (4.00 MiB) per iteration, 50 iterations:
+
+| Kernel | Target Bitwidth | Average Latency | Throughput | Bandwidth |
+| :--- | :--- | :--- | :--- | :--- |
+| **F32 -> Q8_0 (AVX2 SIMD)** | 8.50 BPW | **0.235 ms** | **17,052.57 MiB/s** | **16.653 GiB/s** |
+| **F32 -> F16** | 16.00 BPW | **0.598 ms** | **6,692.34 MiB/s** | **6.535 GiB/s** |
+| **F32 -> Q4_K** | 4.50 BPW | **1.188 ms** | **3,368.09 MiB/s** | **3.289 GiB/s** |
+| **F32 -> Q4_0** | 4.50 BPW | **1.296 ms** | **3,087.19 MiB/s** | **3.015 GiB/s** |
+| **F32 -> Q6_K** | 6.56 BPW | **1.675 ms** | **2,387.47 MiB/s** | **2.332 GiB/s** |
+| **F32 -> Q5_K** | 5.50 BPW | **1.678 ms** | **2,383.69 MiB/s** | **2.328 GiB/s** |
+
+### 3. Knapsack Optimization Solver (`cargo bench -p quant-core`)
+
+MCKP solver dynamic programming optimization runtime across transformer layers:
+
+| Layer Count | Total Tensors Evaluated | Average Latency | Throughput |
+| :--- | :--- | :--- | :--- |
+| **16 Layers** | 147 tensors | **3.44 ms** | ~43k tensor-evals/sec |
+| **32 Layers** | 291 tensors | **4.20 ms** | ~69k tensor-evals/sec |
+| **64 Layers** | 579 tensors | **12.74 ms** | ~45k tensor-evals/sec |
+| **128 Layers** | 1,155 tensors | **28.45 ms** | ~40k tensor-evals/sec |
+
+---
+
+## Running Benchmarks
+
+```bash
+# Execute Rust micro-benchmark suite (SIMD kernels & MCKP solver):
+cargo bench --workspace
+
+# Execute continuous-sampling RSS memory & streaming benchmark:
+python3 benchmarks/e2e_rss_bench.py
+```
 
 ---
 
