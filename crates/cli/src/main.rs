@@ -436,7 +436,14 @@ fn main() -> Result<()> {
                 "\nExecuting streaming quantization to: {}",
                 output.display()
             );
-            let written = StreamQuantizer::stream_safetensors_to_gguf(&model, &output, &plan)?;
+            let written = if model.is_dir()
+                || model.file_name().and_then(|s| s.to_str())
+                    == Some("model.safetensors.index.json")
+            {
+                StreamQuantizer::stream_multi_shard_to_gguf(&model, &output, &plan)?
+            } else {
+                StreamQuantizer::stream_safetensors_to_gguf(&model, &output, &plan)?
+            };
 
             let written_gib = (written as f64) / (1024.0 * 1024.0 * 1024.0);
             println!(
