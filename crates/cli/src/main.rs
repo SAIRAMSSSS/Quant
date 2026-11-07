@@ -447,8 +447,7 @@ fn main() -> Result<()> {
 
             let written_gib = (written as f64) / (1024.0 * 1024.0 * 1024.0);
             println!(
-                "Quantization complete. Payload size: {:.3} GiB. Output: {}",
-                written_gib,
+                "Quantization complete. Payload size: {written_gib:.3} GiB. Output: {}",
                 output.display()
             );
         }
@@ -457,7 +456,7 @@ fn main() -> Result<()> {
             let path = Path::new(&model);
             if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
                 let gguf_hdr = inspect_gguf_file(path)?;
-                println!("GGUF File Inspection: {}", model);
+                println!("GGUF File Inspection: {model}");
                 println!("  Version:           {}", gguf_hdr.version);
                 println!("  Alignment:         {}", gguf_hdr.alignment);
                 println!("  Tensor Count:      {}", gguf_hdr.tensor_count);
@@ -466,14 +465,13 @@ fn main() -> Result<()> {
 
                 println!("\n  Metadata Entries:");
                 for (k, v) in &gguf_hdr.metadata {
-                    println!("    {}: {:?}", k, v);
+                    println!("    {k}: {v:?}");
                 }
 
                 println!("\n  Tensors (first 10):");
                 for (i, t) in gguf_hdr.tensors.iter().take(10).enumerate() {
                     println!(
-                        "    [{:03}] {:<40} {:<6} dims={:?} offset=0x{:X}",
-                        i,
+                        "    [{i:03}] {:<40} {:<6} dims={:?} offset=0x{:X}",
                         t.name,
                         t.ggml_type.as_str(),
                         t.dimensions,
@@ -482,7 +480,7 @@ fn main() -> Result<()> {
                 }
             } else {
                 let header = load_safetensors_header(&model)?;
-                println!("Safetensors Inspection: {}", model);
+                println!("Safetensors Inspection: {model}");
                 println!("  Header Size: {} bytes", header.header_size);
                 println!("  Tensor Count: {}", header.tensors.len());
 
@@ -497,13 +495,13 @@ fn main() -> Result<()> {
                 let total_mparams = (total_elements as f64) / 1_000_000.0;
                 let total_gib = (total_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
 
-                println!("  Total Parameters: {:.2}M", total_mparams);
-                println!("  Raw Weight Size:  {:.2} GiB", total_gib);
+                println!("  Total Parameters: {total_mparams:.2}M");
+                println!("  Raw Weight Size:  {total_gib:.2} GiB");
 
                 if !header.metadata.is_empty() {
                     println!("\n  Metadata:");
                     for (k, v) in &header.metadata {
-                        println!("    {}: {}", k, v);
+                        println!("    {k}: {v}");
                     }
                 }
             }

@@ -1,0 +1,44 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+language: "en-US"
+early_access: false
+tone_instructions: "Be direct, concise, and evidence-led. Prioritize systems correctness, memory invariants, alignment, zero-slop documentation, and strict error handling."
+
+reviews:
+  profile: "assertive"
+  request_changes_workflow: false
+  high_level_summary: true
+  high_level_summary_in_walkthrough: true
+  review_status: true
+  review_details: true
+  commit_status: true
+  fail_commit_status: true
+  auto_review:
+    enabled: true
+    drafts: false
+  path_instructions:
+    - path: "crates/core/**"
+      instructions: |
+        Strictly enforce math correctness for GGML block sizes, KV-cache equations, and MCKP solver invariants.
+        Reject any float-to-int truncations, division by zero, or panicking unwrap/expect calls outside of unit tests.
+    - path: "crates/gguf-bridge/**"
+      instructions: |
+        Audit memory-mapped I/O, page alignment (PAGE_SIZE = 4096), and MADV_DONTNEED cache eviction.
+        Enforce GGUF_DEFAULT_ALIGNMENT (32 bytes) and ensure SIMD kernels are gated behind runtime feature checks.
+        Reject any heap allocations inside streaming loops that exceed the < 500 MB RSS invariant.
+    - path: "crates/hw-probe/**"
+      instructions: |
+        Verify non-failing fallbacks across NVML, AMDGPU sysfs, Metal, and Linux procfs.
+        Hardware probe calls must never panic on machines lacking dedicated GPUs.
+    - path: "crates/cli/**"
+      instructions: |
+        Enforce terse, technical, non-slop ASCII table output.
+        Ensure anyhow error context strings are actionable and descriptive.
+    - path: "crates/py/**"
+      instructions: |
+        Audit PyO3 bindings for memory safety, GIL release during heavy I/O, and correct conversion of Rust errors to PyErr.
+    - path: "{README.md,AGENTS.md}"
+      instructions: |
+        Flag marketing fluff, empty buzzwords, emojis, and unverified performance claims. Maintain concise systems prose.
+
+chat:
+  auto_reply: true

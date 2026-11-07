@@ -311,9 +311,15 @@ pub fn execute_quantization(
     output_path: &str,
     plan: &PyQuantizationPlan,
 ) -> PyResult<u64> {
-    let written =
+    let p = Path::new(model_path);
+    let written = if p.is_dir()
+        || p.file_name().and_then(|s| s.to_str()) == Some("model.safetensors.index.json")
+    {
+        StreamQuantizer::stream_multi_shard_to_gguf(model_path, output_path, &plan.inner_plan)
+    } else {
         StreamQuantizer::stream_safetensors_to_gguf(model_path, output_path, &plan.inner_plan)
-            .map_err(|e| PyValueError::new_err(e.to_string()))?;
+    }
+    .map_err(|e| PyValueError::new_err(e.to_string()))?;
     Ok(written)
 }
 

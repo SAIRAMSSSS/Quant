@@ -12,7 +12,8 @@ pub struct KvCacheConfig {
 }
 
 impl KvCacheConfig {
-    pub fn new(
+    #[must_use]
+    pub const fn new(
         n_layers: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -28,7 +29,8 @@ impl KvCacheConfig {
         }
     }
 
-    pub fn elements_per_token(&self) -> usize {
+    #[must_use]
+    pub const fn elements_per_token(&self) -> usize {
         2 * self.n_layers * self.n_kv_heads * self.head_dim
     }
 
@@ -61,36 +63,36 @@ mod tests {
         let cfg = KvCacheConfig::new(32, 8, 128, 4096, GgmlType::F16);
         let elems = cfg.elements_per_token();
         assert_eq!(elems, 2 * 32 * 8 * 128);
-        assert_eq!(elems, 65536);
+        assert_eq!(elems, 65_536);
 
         let bpt = cfg.bytes_per_token().unwrap();
-        assert_eq!(bpt, 65536 * 2);
-        assert_eq!(bpt, 131072);
+        assert_eq!(bpt, 65_536 * 2);
+        assert_eq!(bpt, 131_072);
 
         let total = cfg.total_bytes().unwrap();
-        assert_eq!(total, 131072 * 4096);
-        assert_eq!(total, 536870912);
+        assert_eq!(total, 131_072 * 4096);
+        assert_eq!(total, 536_870_912);
     }
 
     #[test]
     fn test_llama3_8b_kv_cache_q8_0() {
         let cfg = KvCacheConfig::new(32, 8, 128, 4096, GgmlType::Q8_0);
         let bpt = cfg.bytes_per_token().unwrap();
-        assert_eq!(bpt, (65536 / 32) * 34);
-        assert_eq!(bpt, 69632);
+        assert_eq!(bpt, (65_536 / 32) * 34);
+        assert_eq!(bpt, 69_632);
 
         let total = cfg.total_bytes().unwrap();
-        assert_eq!(total, 69632 * 4096);
+        assert_eq!(total, 69_632 * 4096);
     }
 
     #[test]
     fn test_llama3_8b_kv_cache_q4_0() {
         let cfg = KvCacheConfig::new(32, 8, 128, 4096, GgmlType::Q4_0);
         let bpt = cfg.bytes_per_token().unwrap();
-        assert_eq!(bpt, (65536 / 32) * 18);
-        assert_eq!(bpt, 36864);
+        assert_eq!(bpt, (65_536 / 32) * 18);
+        assert_eq!(bpt, 36_864);
 
         let total = cfg.total_bytes().unwrap();
-        assert_eq!(total, 36864 * 4096);
+        assert_eq!(total, 36_864 * 4096);
     }
 }

@@ -359,9 +359,9 @@ mod tests {
         let meta = parsed.tensors.get("model.embed_tokens.weight").unwrap();
         assert_eq!(meta.dtype, "F16");
         assert_eq!(meta.shape, vec![32000, 4096]);
-        assert_eq!(meta.data_offsets, (0, 262144000));
+        assert_eq!(meta.data_offsets, (0, 262_144_000));
         assert_eq!(meta.element_count(), 32000 * 4096);
-        assert_eq!(meta.byte_size(), 262144000);
+        assert_eq!(meta.byte_size(), 262_144_000);
     }
 
     #[test]

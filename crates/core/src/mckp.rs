@@ -26,23 +26,15 @@ impl TensorRole {
             Self::Embedding => 1.8,
             Self::AttentionQ | Self::AttentionK | Self::AttentionV | Self::AttentionOutput => 1.3,
             Self::MlpDown => 1.25,
-            Self::MlpGate | Self::MlpUp => 1.0,
+            Self::MlpGate | Self::MlpUp | Self::Other => 1.0,
             Self::LayerNorm | Self::Bias => 100.0,
-            Self::Other => 1.0,
         }
     }
 
     pub fn allowed_types(&self) -> &'static [GgmlType] {
         match self {
             Self::LayerNorm | Self::Bias => &[GgmlType::F32],
-            Self::LmHead => &[
-                GgmlType::Q8_0,
-                GgmlType::Q6_K,
-                GgmlType::Q5_K,
-                GgmlType::Q4_K,
-                GgmlType::F16,
-            ],
-            Self::Embedding => &[
+            Self::LmHead | Self::Embedding => &[
                 GgmlType::Q8_0,
                 GgmlType::Q6_K,
                 GgmlType::Q5_K,
